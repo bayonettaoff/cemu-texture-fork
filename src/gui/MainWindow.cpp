@@ -25,6 +25,8 @@
 #include "gui/CemuUpdateWindow.h"
 #include "gui/LoggingWindow.h"
 #include "config/ActiveSettings.h"
+#include "Cafe/HW/Latte/Core/LatteTAA.h"
+#include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 #include "config/LaunchSettings.h"
 
 #include "Cafe/Filesystem/FST/FST.h"
@@ -146,6 +148,14 @@ enum
 	MAINFRAME_MENU_ID_DEBUG_DUMP_RAM,
 	MAINFRAME_MENU_ID_DEBUG_DUMP_FST,
 	MAINFRAME_MENU_ID_DEBUG_DUMP_CURL_REQUESTS,
+	// debug->taa
+	MAINFRAME_MENU_ID_DEBUG_TAA = 21620,
+	MAINFRAME_MENU_ID_DEBUG_TAA_JITTER,
+	MAINFRAME_MENU_ID_DEBUG_TAA_PASSTHROUGH,
+	// debug->texture replacement
+	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP = 21630,
+	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD,
+	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET,
 	// help
 	MAINFRAME_MENU_ID_HELP_ABOUT = 21700,
 	MAINFRAME_MENU_ID_HELP_UPDATE,
@@ -205,6 +215,12 @@ EVT_MENU_RANGE(MAINFRAME_MENU_ID_DEBUG_LOGGING0 + 0, MAINFRAME_MENU_ID_DEBUG_LOG
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_ADVANCED_PPC_INFO, MainWindow::OnPPCInfoToggle)
 // debug -> dump menu
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DUMP_TEXTURES, MainWindow::OnDebugDumpUsedTextures)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA, MainWindow::OnDebugTAAToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA_JITTER, MainWindow::OnDebugTAAJitterToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA_PASSTHROUGH, MainWindow::OnDebugTAAPassthroughToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, MainWindow::OnDebugTexReplaceDumpToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, MainWindow::OnDebugTexReplaceReload)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, MainWindow::OnDebugTexReplaceForget)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DUMP_SHADERS, MainWindow::OnDebugDumpUsedShaders)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DUMP_CURL_REQUESTS, MainWindow::OnDebugSetting)
 // debug -> Other options
@@ -1103,6 +1119,39 @@ void MainWindow::OnDebugDumpUsedTextures(wxCommandEvent& event)
 			ActiveSettings::EnableDumpTextures(false);
 		}
 	}
+}
+
+void MainWindow::OnDebugTAAToggle(wxCommandEvent& event)
+{
+	LatteTAA::GetConfig().enabled = event.IsChecked();
+	LatteTAA::InvalidateHistory();
+}
+
+void MainWindow::OnDebugTAAJitterToggle(wxCommandEvent& event)
+{
+	LatteTAA::GetConfig().jitterEnabled = event.IsChecked();
+	LatteTAA::InvalidateHistory();
+}
+
+void MainWindow::OnDebugTAAPassthroughToggle(wxCommandEvent& event)
+{
+	LatteTAA::GetConfig().debugPassthrough = event.IsChecked();
+	LatteTAA::InvalidateHistory();
+}
+
+void MainWindow::OnDebugTexReplaceDumpToggle(wxCommandEvent& event)
+{
+	LatteTextureReplacement::SetDumpEnabled(event.IsChecked());
+}
+
+void MainWindow::OnDebugTexReplaceReload(wxCommandEvent& event)
+{
+	LatteTextureReplacement::InvalidateIndex();
+}
+
+void MainWindow::OnDebugTexReplaceForget(wxCommandEvent& event)
+{
+	LatteTextureReplacement::RequestForget();
 }
 
 void MainWindow::OnDebugDumpUsedShaders(wxCommandEvent& event)
@@ -2246,6 +2295,13 @@ void MainWindow::RecreateMenu()
 
 	auto accurateBarriers = debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_VK_ACCURATE_BARRIERS, _("&Accurate barriers (Vulkan)"), wxEmptyString);
 	accurateBarriers->Check(GetConfig().vk_accurate_barriers);
+
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA, _("&TAA experimental (Vulkan)"), wxEmptyString)->Check(LatteTAA::GetConfig().enabled);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA_JITTER, _("TAA: &viewport jitter"), wxEmptyString)->Check(LatteTAA::GetConfig().jitterEnabled);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA_PASSTHROUGH, _("TAA: &current frame only (debug)"), wxEmptyString)->Check(LatteTAA::GetConfig().debugPassthrough);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, _("&Textures: dump for replacement (hash)"), wxEmptyString)->Check(LatteTextureReplacement::IsDumpEnabled());
+	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, _("Textures: &reload replacement folder"), wxEmptyString);
+	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, _("Textures: &forget replacements (unloads all loaded textures)"), wxEmptyString);
 
 	debugMenu->AppendSeparator();
 

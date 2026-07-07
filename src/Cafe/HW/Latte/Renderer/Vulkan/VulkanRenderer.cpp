@@ -26,6 +26,8 @@
 #include "Cafe/TitleList/GameInfo.h"
 
 #include "Cafe/HW/Latte/Core/LatteTiming.h" // vsync control
+#include "Cafe/HW/Latte/Core/LatteTAA.h"
+#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTAAFilter.h"
 
 #include <glslang/Public/ShaderLang.h>
 
@@ -2992,6 +2994,17 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &scissor);
 
 	auto descriptSet = backbufferBlit_createDescriptorSet(m_swapchainDescriptorSetLayout, texViewVk, useLinearTexFilter);
+
+	// TAA: present the resolved image instead of the game's scanout texture
+	// (the filter never writes into game textures)
+	if (!padView && LatteTAA::GetConfig().enabled)
+	{
+		sint32 taaEffWidth, taaEffHeight;
+		texView->baseTexture->GetEffectiveSize(taaEffWidth, taaEffHeight, 0);
+		VkDescriptorSet taaSet = VulkanTAAFilter::GetInstance().GetPresentDescriptorSet(this, m_swapchainDescriptorSetLayout, taaEffWidth, taaEffHeight);
+		if (taaSet != VK_NULL_HANDLE)
+			descriptSet = taaSet;
+	}
 
 	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 

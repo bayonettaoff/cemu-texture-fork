@@ -6,6 +6,7 @@
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
 #include "Cafe/HW/Latte/Core/LatteTexture.h"
+#include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 #include "Cafe/HW/Latte/Core/LatteCachedFBO.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
@@ -22,6 +23,9 @@ uint32 prevScissorWidth = 0;
 uint32 prevScissorHeight = 0;
 
 bool hasValidFramebufferAttached = false;
+
+#include "Cafe/HW/Latte/Core/LatteTAA.h"
+#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 
 struct LatteMRTQuad
 {
@@ -701,6 +705,8 @@ void LatteRenderTarget_itHLESwapScanBuffer()
 	catchOpenGLError();
 	performanceMonitor.gpuTime_frameTime.beginMeasuring();
 
+	if (LatteTextureReplacement::ConsumeForgetRequest())
+		LatteTC_UnloadAllTextures(); // drop every live texture so replacements get re-evaluated against the freshly-rescanned folder
 	LatteTC_CleanupUnusedTextures();
 	LatteDraw_cleanupAfterFrame();
 	LatteQuery_CancelActiveGPU7Queries();
@@ -878,6 +884,10 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 	LatteTexture_UpdateDataToLatest(textureView->baseTexture);
 	// mark source texture as still in use
 	LatteTC_MarkTextureStillInUse(textureView->baseTexture);
+
+	// TAA temporal resolve (Vulkan only)
+	if (!isPadView && LatteTAA::GetConfig().enabled && g_renderer->GetType() == RendererAPI::Vulkan)
+		VulkanRenderer::GetInstance()->TAA_Apply(textureView);
 
 	sint32 effectiveWidth, effectiveHeight;
 	textureView->baseTexture->GetEffectiveSize(effectiveWidth, effectiveHeight, 0);
@@ -1064,6 +1074,22 @@ void LatteRenderTarget_updateViewport()
 		vpY *= ((float)sLatteRenderTargetState.currentEffectiveSize.height / (float)sLatteRenderTargetState.currentRenderSize.height);
 		vpWidth *= ((float)sLatteRenderTargetState.currentEffectiveSize.width / (float)sLatteRenderTargetState.currentRenderSize.width);
 		vpHeight *= ((float)sLatteRenderTargetState.currentEffectiveSize.height / (float)sLatteRenderTargetState.currentRenderSize.height);
+	}
+	// TAA: subpixel jitter on scene passes
+	{
+		float taaJitterX, taaJitterY;
+		if (LatteTAA::GetViewportJitter(
+				LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_Z_ENABLE(),
+				LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_Z_WRITE_ENABLE(),
+				sLatteCurrentRendertargets.colorBuffer[0].view != nullptr,
+				vpWidth, vpHeight,
+				sLatteRenderTargetState.currentEffectiveSize.width,
+				sLatteRenderTargetState.currentEffectiveSize.height,
+				taaJitterX, taaJitterY))
+		{
+			vpX += taaJitterX;
+			vpY += taaJitterY;
+		}
 	}
 	g_renderer->renderTarget_setViewport(vpX, vpY, vpWidth, vpHeight, nearZ, farZ, halfZ);
 }

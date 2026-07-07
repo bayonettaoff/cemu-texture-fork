@@ -5,6 +5,7 @@
 
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
+#include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 
 #include "Cafe/GraphicPack/GraphicPack2.h"
 
@@ -1308,10 +1309,14 @@ LatteTexture::LatteTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddre
 	{
 		this->enableReadback = true;
 	}
+	// texture replacement may request a resolution overwrite (larger PNG); must
+	// happen here since the derived class sizes the host image in its constructor
+	LatteTextureReplacement::OnTextureCreated(this);
 }
 
 LatteTexture::~LatteTexture()
 {
+	LatteTextureReplacement::OnTextureDeleted(this);
 	_RemoveTextureFromGlobalList(this);
 	cemu_assert_debug(baseView == nullptr);
 	cemu_assert_debug(views.empty());

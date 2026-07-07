@@ -213,6 +213,10 @@ public:
 	VkDevice GetLogicalDevice() const { return m_logicalDevice; }
 	VkPhysicalDevice GetPhysicalDevice() const { return m_physicalDevice; }
 
+	// TAA (implemented in VulkanTAAFilter.cpp)
+	void TAA_Apply(LatteTextureView* textureView);
+	VkCommandBuffer TAA_GetCommandBuffer();
+
 	VkDescriptorPool GetDescriptorPool() const { return m_descriptorPool; }
 
 	void WaitDeviceIdle() const { vkDeviceWaitIdle(m_logicalDevice); }

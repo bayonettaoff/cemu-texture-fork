@@ -2,6 +2,7 @@
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 #include "config/ActiveSettings.h"
 #include "Cafe/CafeSystem.h"
+#include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 
 //#define BENCHMARK_TEXTURE_DECODING		// if defined, time it takes to decode textures will be measured and logged to log.txt
 
@@ -590,6 +591,9 @@ void LatteTextureLoader_loadTextureDataIntoSlice(LatteTexture* hostTexture, sint
 	cemu_assert_debug(mipLevels == hostTexture->mipLevels);
 	if (hostTexture->overwriteInfo.hasResolutionOverwrite || hostTexture->overwriteInfo.hasFormatOverwrite)
 	{
+		// resolution overwrites requested by texture replacement upload their own data
+		if (LatteTextureReplacement::LoadUpscaledSlice(hostTexture, sliceIndex, mipIndex))
+			return;
 		// todo - ideally, we should scale/convert the data to the new format and resolution
 		g_renderer->texture_clearSlice(hostTexture, sliceIndex, mipIndex);
 	}
@@ -654,6 +658,10 @@ void LatteTextureLoader_UpdateTextureSliceData(LatteTexture* tex, uint32 sliceIn
 	if (tex->overwriteInfo.hasFormatOverwrite == false && tex->overwriteInfo.hasResolutionOverwrite == false)
 	{
 		texDecoder->decode(&textureLoader, pixelData);
+		// file-based texture replacement (see LatteTextureReplacement.h)
+		if (LatteTextureReplacement::IsDumpEnabled())
+			LatteTextureReplacement::DumpForReplacement(tex, &textureLoader, texDecoder, sliceIndex, mipIndex, pixelData, imageSize);
+		LatteTextureReplacement::Apply(tex, &textureLoader, texDecoder, sliceIndex, mipIndex, pixelData, imageSize);
 	}
 #ifdef BENCHMARK_TEXTURE_DECODING
 	QueryPerformanceCounter(&benchmark_end);

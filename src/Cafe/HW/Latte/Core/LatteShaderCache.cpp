@@ -4,6 +4,7 @@
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
+#include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 #include "Cemu/FileCache/FileCache.h"
 #include "Cafe/GameProfile/GameProfile.h"
 #include "gui/guiWrapper.h"
@@ -347,6 +348,9 @@ void LatteShaderCache_Load()
 	GetProcessMemoryInfo(GetCurrentProcess(), &pmc1, sizeof(PROCESS_MEMORY_COUNTERS));
 	LONGLONG totalMem1 = pmc1.PagefileUsage;
 #endif
+	// preprocess texture replacements (filter + bake PNG -> mip-mapped DDS) while
+	// we are still on the loading screen, so gameplay never decodes PNGs
+	LatteTextureReplacement::PreprocessReplaceFolder();
 	// init shader parallel compile queue
 	LatteShaderCache_initCompileQueue();
 	// create directories

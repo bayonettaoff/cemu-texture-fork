@@ -114,6 +114,8 @@ add_library(CemuCafe
   HW/Latte/Core/LatteQuery.cpp
   HW/Latte/Core/LatteQueryObject.h
   HW/Latte/Core/LatteRenderTarget.cpp
+  HW/Latte/Core/LatteTAA.cpp
+  HW/Latte/Core/LatteTAA.h
   HW/Latte/Core/LatteRingBuffer.cpp
   HW/Latte/Core/LatteRingBuffer.h
   HW/Latte/Core/LatteShaderAssembly.h
@@ -132,6 +134,8 @@ add_library(CemuCafe
   HW/Latte/Core/LatteTextureLegacy.cpp
   HW/Latte/Core/LatteTextureLoader.cpp
   HW/Latte/Core/LatteTextureLoader.h
+  HW/Latte/Core/LatteTextureReplacement.cpp
+  HW/Latte/Core/LatteTextureReplacement.h
   HW/Latte/Core/LatteTextureReadback.cpp
   HW/Latte/Core/LatteTextureReadbackInfo.h
   HW/Latte/Core/LatteTextureView.cpp
@@ -206,6 +210,8 @@ add_library(CemuCafe
   HW/Latte/Renderer/Vulkan/VulkanRenderer.cpp
   HW/Latte/Renderer/Vulkan/VulkanRenderer.h
   HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
+  HW/Latte/Renderer/Vulkan/VulkanTAAFilter.cpp
+  HW/Latte/Renderer/Vulkan/VulkanTAAFilter.h
   HW/Latte/Renderer/Vulkan/VulkanTextureReadback.h
   HW/Latte/ShaderInfo/ShaderDescription.cpp
   HW/Latte/ShaderInfo/ShaderInfo.h

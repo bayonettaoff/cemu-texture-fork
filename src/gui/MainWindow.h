@@ -109,6 +109,12 @@ public:
 	void OnPPCInfoToggle(wxCommandEvent& event);
 	void OnDebugDumpUsedTextures(wxCommandEvent& event);
 	void OnDebugDumpUsedShaders(wxCommandEvent& event);
+	void OnDebugTAAToggle(wxCommandEvent& event);
+	void OnDebugTAAJitterToggle(wxCommandEvent& event);
+	void OnDebugTAAPassthroughToggle(wxCommandEvent& event);
+	void OnDebugTexReplaceDumpToggle(wxCommandEvent& event);
+	void OnDebugTexReplaceReload(wxCommandEvent& event);
+	void OnDebugTexReplaceForget(wxCommandEvent& event);
 	void OnLoggingWindow(wxCommandEvent& event);
 	void OnGDBStubToggle(wxCommandEvent& event);
 	void OnDebugViewPPCThreads(wxCommandEvent& event);
