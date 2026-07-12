@@ -10,6 +10,7 @@
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
 
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
+#include "Cafe/HW/Latte/Core/LatteShader.h"
 
 #include "Cafe/CafeSystem.h"
 
@@ -28,6 +29,17 @@
 #include "Cafe/HW/Latte/Core/LatteTiming.h" // vsync control
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTAAFilter.h"
+#include "Cafe/HW/Latte/Core/LatteSSAO.h"
+#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanSSAOFilter.h"
+#include "Cafe/HW/Latte/Core/LatteDLSS.h"
+
+#if BOOST_OS_WINDOWS
+// DLAA - NVIDIA's real NGX/DLSS SDK (dependencies/DLSS)
+#include <nvsdk_ngx.h>
+#include <nvsdk_ngx_vk.h>
+#include <nvsdk_ngx_helpers_vk.h>
+#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanDLSSFilter.h"
+#endif
 
 #include <glslang/Public/ShaderLang.h>
 
@@ -540,6 +552,10 @@ VulkanRenderer::VulkanRenderer()
 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_graphicsQueue);
 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_presentQueue);
 
+#if BOOST_OS_WINDOWS
+	InitNGX();
+#endif
+
 	vkDestroySurfaceKHR(m_instance, surface, nullptr);
 
 	if (useValidationLayer && m_featureControl.instanceExtensions.debug_utils)
@@ -715,6 +731,10 @@ VulkanRenderer::~VulkanRenderer()
 
 	// destroy memory manager
 	memoryManager.reset();
+
+#if BOOST_OS_WINDOWS
+	ShutdownNGX(); // must run before the device/instance below are destroyed
+#endif
 
 	// destroy instance, devices
 	if (m_instance != VK_NULL_HANDLE)
@@ -1095,6 +1115,48 @@ std::vector<VkDeviceQueueCreateInfo> VulkanRenderer::CreateQueueCreateInfos(cons
 	return queueCreateInfos;
 }
 
+#if BOOST_OS_WINDOWS
+namespace
+{
+	// DLAA (see LatteDLSS.h): the flat, instance/device-independent extension query.
+	// Deprecated in favor of the per-feature GetFeature*ExtensionRequirements() API, but
+	// simpler to thread through Cemu's existing extension-gathering code, and NGX still
+	// supports it. Queried once and cached - the answer can't change at runtime.
+	// Safe to call even without an NVIDIA GPU present: NGX just reports failure/empty lists.
+	struct NGXRequiredExtensions
+	{
+		std::vector<std::string> instanceExtensions;
+		std::vector<std::string> deviceExtensions;
+	};
+
+	const NGXRequiredExtensions& GetNGXRequiredExtensions()
+	{
+		static NGXRequiredExtensions s_result;
+		static bool s_queried = false;
+		if (!s_queried)
+		{
+			s_queried = true;
+			unsigned int instCount = 0, devCount = 0;
+			const char** instExts = nullptr;
+			const char** devExts = nullptr;
+			NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_RequiredExtensions(&instCount, &instExts, &devCount, &devExts);
+			if (result == NVSDK_NGX_Result_Success)
+			{
+				for (unsigned int i = 0; i < instCount; i++)
+					s_result.instanceExtensions.emplace_back(instExts[i]);
+				for (unsigned int i = 0; i < devCount; i++)
+					s_result.deviceExtensions.emplace_back(devExts[i]);
+			}
+			else
+			{
+				cemuLog_log(LogType::Force, "DLAA: NVSDK_NGX_VULKAN_RequiredExtensions failed (result={:#x}), DLAA will be unavailable", (uint32)result);
+			}
+		}
+		return s_result;
+	}
+}
+#endif
+
 VkDeviceCreateInfo VulkanRenderer::CreateDeviceCreateInfo(const std::vector<VkDeviceQueueCreateInfo>& queueCreateInfos, const VkPhysicalDeviceFeatures& deviceFeatures, const void* deviceExtensionStructs, std::vector<const char*>& used_extensions) const
 {
 	used_extensions = kRequiredDeviceExtensions;
@@ -1124,6 +1186,11 @@ VkDeviceCreateInfo VulkanRenderer::CreateDeviceCreateInfo(const std::vector<VkDe
 		used_extensions.emplace_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 	if (m_featureControl.deviceExtensions.present_wait)
 		used_extensions.emplace_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+#if BOOST_OS_WINDOWS
+	// DLAA (see LatteDLSS.h) - already filtered down to what this device supports
+	for (const auto& ext : m_featureControl.ngxDeviceExtensions)
+		used_extensions.emplace_back(ext.c_str());
+#endif
 
 	VkDeviceCreateInfo createInfo{};
 	createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1143,6 +1210,69 @@ VkDeviceCreateInfo VulkanRenderer::CreateDeviceCreateInfo(const std::vector<VkDe
 
 	return createInfo;
 }
+
+#if BOOST_OS_WINDOWS
+void VulkanRenderer::InitNGX()
+{
+	// DLAA (see LatteDLSS.h). Always attempted regardless of whether the user has actually
+	// requested DLAA (LatteDLSS::GetConfig().enabled) - this only probes availability and is
+	// cheap; the per-frame filter (added separately) is what actually checks the config toggle.
+	// Safe on non-NVIDIA GPUs: NGX detects that itself and reports FAIL_FeatureNotSupported,
+	// it doesn't require an NVIDIA GPU to be present just to call these functions.
+	const fs::path dataPath = ActiveSettings::GetUserDataPath("ngx");
+	std::error_code ec;
+	fs::create_directories(dataPath, ec);
+
+	// No NVIDIA-issued Application ID for this fork - use the SDK's documented ProjectID path
+	// instead (NVSDK_NGX_Init_with_ProjectID), which exists exactly for engines/projects
+	// without a registered ID. The driver validates that this looks like a GUID; it does not
+	// need to be registered with NVIDIA anywhere.
+	static const char* kProjectId = "a63f6c8e-2b3d-4e91-9c7a-5f1d8b0e2f4c";
+	const std::string engineVersion = fmt::format("{}.{}.{}", EMULATOR_VERSION_MAJOR, EMULATOR_VERSION_MINOR, EMULATOR_VERSION_PATCH);
+	const std::wstring dataPathW = dataPath.wstring();
+
+	NVSDK_NGX_Result result = NVSDK_NGX_VULKAN_Init_with_ProjectID(
+		kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, engineVersion.c_str(),
+		dataPathW.c_str(), m_instance, m_physicalDevice, m_logicalDevice);
+
+	if (result != NVSDK_NGX_Result_Success)
+	{
+		cemuLog_log(LogType::Force, "DLAA: NGX init failed (result={:#x}) - unavailable (expected on non-NVIDIA GPUs, old drivers, or missing nvngx_dlss.dll)", (uint32)result);
+		return;
+	}
+	m_ngxInitialized = true;
+
+	NVSDK_NGX_Parameter* params = nullptr;
+	result = NVSDK_NGX_VULKAN_GetCapabilityParameters(&params);
+	if (result != NVSDK_NGX_Result_Success || !params)
+	{
+		cemuLog_log(LogType::Force, "DLAA: NGX GetCapabilityParameters failed (result={:#x})", (uint32)result);
+		return;
+	}
+	m_ngxCapabilityParams = params;
+
+	int superSamplingAvailable = 0;
+	NVSDK_NGX_Result queryResult = NVSDK_NGX_Parameter_GetI(params, NVSDK_NGX_Parameter_SuperSampling_Available, &superSamplingAvailable);
+	m_ngxDLAASupported = (queryResult == NVSDK_NGX_Result_Success) && (superSamplingAvailable != 0);
+
+	cemuLog_log(LogType::Force, "DLAA: NGX initialized, SuperSampling/DLAA available = {}", m_ngxDLAASupported);
+}
+
+void VulkanRenderer::ShutdownNGX()
+{
+	if (m_ngxCapabilityParams)
+	{
+		NVSDK_NGX_VULKAN_DestroyParameters(m_ngxCapabilityParams);
+		m_ngxCapabilityParams = nullptr;
+	}
+	if (m_ngxInitialized)
+	{
+		NVSDK_NGX_VULKAN_Shutdown1(m_logicalDevice);
+		m_ngxInitialized = false;
+	}
+	m_ngxDLAASupported = false;
+}
+#endif
 
 RendererShader* VulkanRenderer::shader_create(RendererShader::ShaderType type, uint64 baseHash, uint64 auxHash, const std::string& source, bool isGameShader, bool isGfxPackShader)
 {
@@ -1222,6 +1352,17 @@ bool VulkanRenderer::CheckDeviceExtensionSupport(const VkPhysicalDevice device, 
 	info.deviceExtensions.dynamic_rendering = false; // isExtensionAvailable(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 	// dynamic rendering doesn't provide any benefits for us right now. Driver implementations are very unoptimized as of Feb 2022
 	info.deviceExtensions.present_wait = isExtensionAvailable(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) && isExtensionAvailable(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+
+#if BOOST_OS_WINDOWS
+	// DLAA (see LatteDLSS.h) - only keep the ones this specific device actually exposes;
+	// InitNGX() will fail gracefully later if something essential ended up missing here
+	info.ngxDeviceExtensions.clear();
+	for (const auto& ext : GetNGXRequiredExtensions().deviceExtensions)
+	{
+		if (isExtensionAvailable(ext.c_str()))
+			info.ngxDeviceExtensions.emplace_back(ext);
+	}
+#endif
 
 	// check for framedebuggers
 	info.debugMarkersSupported = false;
@@ -1316,6 +1457,15 @@ std::vector<const char*> VulkanRenderer::CheckInstanceExtensionSupport(FeatureCo
 	info.instanceExtensions.debug_utils = isExtensionAvailable(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 	if (info.instanceExtensions.debug_utils)
 		enabledInstanceExtensions.emplace_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+#if BOOST_OS_WINDOWS
+	// DLAA (see LatteDLSS.h) - only add what this system's loader actually reports as available;
+	// InitNGX() will fail gracefully later if something essential ended up missing here
+	for (const auto& ext : GetNGXRequiredExtensions().instanceExtensions)
+	{
+		if (isExtensionAvailable(ext.c_str()))
+			enabledInstanceExtensions.emplace_back(ext.c_str());
+	}
+#endif
 	return enabledInstanceExtensions;
 }
 
@@ -3006,6 +3156,30 @@ void VulkanRenderer::DrawBackbufferQuad(LatteTextureView* texView, RendererOutpu
 			descriptSet = taaSet;
 	}
 
+	// DLAA: present the NGX output instead if valid (real neural-net temporal AA,
+	// replaces TAA's own resolve when active)
+#if BOOST_OS_WINDOWS
+	if (!padView && LatteDLSS::GetConfig().enabled)
+	{
+		sint32 dlaaEffWidth, dlaaEffHeight;
+		texView->baseTexture->GetEffectiveSize(dlaaEffWidth, dlaaEffHeight, 0);
+		VkDescriptorSet dlaaSet = VulkanDLSSFilter::GetInstance().GetPresentDescriptorSet(this, m_swapchainDescriptorSetLayout, dlaaEffWidth, dlaaEffHeight);
+		if (dlaaSet != VK_NULL_HANDLE)
+			descriptSet = dlaaSet;
+	}
+#endif
+
+	// SSAO/SSR pass: chained after TAA/DLAA, present its output instead if valid (it
+	// already sampled whichever of DLAA's / TAA's output / raw scanout was available)
+	if (!padView && LatteSSAO::AnyEffectEnabled())
+	{
+		sint32 ssaoEffWidth, ssaoEffHeight;
+		texView->baseTexture->GetEffectiveSize(ssaoEffWidth, ssaoEffHeight, 0);
+		VkDescriptorSet ssaoSet = VulkanSSAOFilter::GetInstance().GetPresentDescriptorSet(this, m_swapchainDescriptorSetLayout, ssaoEffWidth, ssaoEffHeight);
+		if (ssaoSet != VK_NULL_HANDLE)
+			descriptSet = ssaoSet;
+	}
+
 	vkCmdBeginRenderPass(m_state.currentCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
 	if (clearBackground)
@@ -3776,6 +3950,18 @@ void VulkanRenderer::AppendOverlayDebugInfo()
 
 	ImGui::Text("BeginRP/f      %u", performanceMonitor.vk.numBeginRenderpassPerFrame.get());
 	ImGui::Text("Barriers/f     %u", performanceMonitor.vk.numDrawBarriersPerFrame.get());
+
+	// most-recently-used pixel shaders, most recent first, with a hit count.
+	// Meant for identifying which shader drives a specific visual effect
+	// (e.g. a game's own post-process pass) when hunting for a graphic pack
+	// patch target: pause on the effect, read the hash here, then find the
+	// matching "<hash>_<auxHash>_ps.txt" in dump/shaders/ (Debug -> Dump used
+	// shaders) for the actual decompiled source - far more reliable than
+	// guessing through a cold dump of a full play session's worth of shaders
+	ImGui::Text("--- Recent pixel shaders (most recent first) ---");
+	for (auto& entry : LatteSHRC_GetRecentPixelShaders())
+		ImGui::Text("%016llx_%016llx  x%u", (unsigned long long)entry.baseHash, (unsigned long long)entry.auxHash, entry.hitCount);
+
 	ImGui::Text("--- Cache debug info ---");
 
 	uint32 bufferCacheHeapSize = 0;

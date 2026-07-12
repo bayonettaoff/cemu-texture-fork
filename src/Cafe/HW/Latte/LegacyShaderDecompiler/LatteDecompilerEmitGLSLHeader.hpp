@@ -63,6 +63,16 @@ namespace LatteDecompiler
 			uniformOffsets.offset_windowSpaceToClipSpaceTransform = uniformCurrentOffset;
 			uniformCurrentOffset += 8;
 		}
+		// TAA clip-space jitter (LatteTAA::Config::clipSpaceJitter) - see SET_POSITION below for
+		// where this actually gets applied. Needed by vertex AND geometry shaders since either
+		// can perform the final position export
+		if ((decompilerContext->shaderType == LatteConst::ShaderType::Vertex || decompilerContext->shaderType == LatteConst::ShaderType::Geometry) && LatteTAA::GetConfig().clipSpaceJitter)
+		{
+			uniformCurrentOffset = (uniformCurrentOffset + 7)&~7;
+			shaderSrc->add("uniform vec2 uf_taaJitter;" _CRLF);
+			uniformOffsets.offset_taaJitter = uniformCurrentOffset;
+			uniformCurrentOffset += 8;
+		}
 		bool alphaTestEnable = decompilerContext->contextRegistersNew->SX_ALPHA_TEST_CONTROL.get_ALPHA_TEST_ENABLE();
 		if (decompilerContext->shaderType == LatteConst::ShaderType::Pixel && alphaTestEnable)
 		{
@@ -265,13 +275,21 @@ namespace LatteDecompiler
 			if (decompilerContext->analyzer.hasStreamoutWrite)
 				src->add("#define XFB_BLOCK_LAYOUT(__bufferIndex, __stride, __location) layout(location = __location, xfb_buffer = __bufferIndex, xfb_stride = __stride, xfb_offset = 0)" _CRLF);
 
+			// TAA clip-space jitter: added before the perspective divide (scaled by w, like the
+			// rest of the position), so the resulting screen-space offset is the same regardless
+			// of a vertex's depth - unlike the old viewport-offset jitter this fork used to use,
+			// confirmed (via an NVIDIA dev forum report of the exact same viewport approach and
+			// symptom) to shift objects at different depths by different amounts, producing a
+			// per-depth-layer misalignment that reads as shimmer/moire on detailed geometry even
+			// with the camera and scene otherwise static
+			const char* taaJitterTerm = (LatteTAA::GetConfig().clipSpaceJitter) ? "; gl_Position.xy += uf_taaJitter.xy * gl_Position.w" : "";
 			if (decompilerContext->contextRegistersNew->PA_CL_CLIP_CNTL.get_DX_CLIP_SPACE_DEF())
 			{
-				src->add("#define SET_POSITION(_v) gl_Position = _v" _CRLF);
+				src->addFmt("#define SET_POSITION(_v) gl_Position = _v{}" _CRLF, taaJitterTerm);
 			}
 			else
 			{
-				src->add("#define SET_POSITION(_v) gl_Position = _v; gl_Position.z = (gl_Position.z + gl_Position.w) / 2.0" _CRLF);
+				src->addFmt("#define SET_POSITION(_v) gl_Position = _v; gl_Position.z = (gl_Position.z + gl_Position.w) / 2.0{}" _CRLF, taaJitterTerm);
 			}
 
 			if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex || decompilerContext->shaderType == LatteConst::ShaderType::Geometry)

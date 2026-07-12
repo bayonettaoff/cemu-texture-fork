@@ -66,9 +66,8 @@ namespace LatteTextureReplacement
 	bool ConsumeForgetRequest();
 
 	// runs once per game boot (from the shader cache loading phase, before any
-	// texture loads): filters out unwanted PNG replacements (textures whose dump
-	// original has alpha, and normal maps by color signature) into
-	// "textureReplace_excluidas/", then bakes the remaining PNGs into mip-mapped
-	// DDS files so gameplay never pays for PNG decoding or BC compression
+	// texture loads): bakes PNG replacements into mip-mapped DDS files so
+	// gameplay never pays for PNG decoding or BC compression; restores alpha
+	// from the dump original when the upscaler flattened it
 	void PreprocessReplaceFolder();
 }

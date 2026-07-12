@@ -147,3 +147,12 @@ endif()
 if (ENABLE_WXWIDGETS)
 	target_link_libraries(CemuBin PRIVATE wx::base wx::core)
 endif()
+
+if(WIN32)
+	# NGX runtime DLL for DLAA (see LatteDLSS.h) - not a link-time dependency, so vcpkg's
+	# applocal deploy step won't pick it up on its own; NGX loads it dynamically at Init time.
+	add_custom_command(TARGET CemuBin POST_BUILD
+		COMMAND ${CMAKE_COMMAND} ARGS -E copy_if_different
+			"${CMAKE_SOURCE_DIR}/dependencies/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll"
+			"${CMAKE_CURRENT_SOURCE_DIR}/../bin/nvngx_dlss.dll")
+endif()

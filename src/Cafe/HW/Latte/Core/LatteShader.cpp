@@ -52,6 +52,40 @@ uint64 _shaderBaseHash_ps;
 std::atomic_int g_compiled_shaders_total = 0;
 std::atomic_int g_compiled_shaders_async = 0;
 
+// most-recently-used ring of active pixel shaders, for the live debug overlay
+// (VulkanRenderer::AppendOverlayDebugInfo) - lets the user pause on a visual
+// effect and read off the exact shader hash driving it instead of guessing
+// through the static shader dump (no semantic names survive decompilation,
+// so a cold dump of 1000+ shaders can't be searched by what the effect does)
+static constexpr size_t kRecentPSCap = 16;
+static std::vector<LatteSHRC_RecentPSEntry> s_recentPixelShaders;
+
+static void LatteSHRC_TrackRecentPixelShader(uint64 baseHash, uint64 auxHash)
+{
+	for (size_t i = 0; i < s_recentPixelShaders.size(); i++)
+	{
+		if (s_recentPixelShaders[i].baseHash == baseHash && s_recentPixelShaders[i].auxHash == auxHash)
+		{
+			s_recentPixelShaders[i].hitCount++;
+			if (i != 0)
+			{
+				auto entry = s_recentPixelShaders[i];
+				s_recentPixelShaders.erase(s_recentPixelShaders.begin() + i);
+				s_recentPixelShaders.insert(s_recentPixelShaders.begin(), entry);
+			}
+			return;
+		}
+	}
+	if (s_recentPixelShaders.size() >= kRecentPSCap)
+		s_recentPixelShaders.pop_back();
+	s_recentPixelShaders.insert(s_recentPixelShaders.begin(), { baseHash, auxHash, 1 });
+}
+
+const std::vector<LatteSHRC_RecentPSEntry>& LatteSHRC_GetRecentPixelShaders()
+{
+	return s_recentPixelShaders;
+}
+
 LatteFetchShader* LatteSHRC_GetActiveFetchShader()
 {
 	return _activeFetchShader;
@@ -630,6 +664,7 @@ LatteDecompilerShader* LatteShader_CreateShaderFromDecompilerOutput(LatteDecompi
 		shader->uniform.loc_uniformRegister = decompilerOutput.uniformOffsetsVK.offset_uniformRegister;
 		shader->uniform.count_uniformRegister = decompilerOutput.uniformOffsetsVK.count_uniformRegister;
 		shader->uniform.loc_windowSpaceToClipSpaceTransform = decompilerOutput.uniformOffsetsVK.offset_windowSpaceToClipSpaceTransform;
+		shader->uniform.loc_taaJitter = decompilerOutput.uniformOffsetsVK.offset_taaJitter;
 		shader->uniform.loc_alphaTestRef = decompilerOutput.uniformOffsetsVK.offset_alphaTestRef;
 		shader->uniform.loc_pointSize = decompilerOutput.uniformOffsetsVK.offset_pointSize;
 		shader->uniform.loc_fragCoordScale = decompilerOutput.uniformOffsetsVK.offset_fragCoordScale;
@@ -904,6 +939,7 @@ void LatteSHRC_UpdatePixelShader(uint8* pixelShaderPtr, uint32 pixelShaderSize, 
 		return;
 	}
 	_activePixelShader = pixelShader;
+	LatteSHRC_TrackRecentPixelShader(pixelShader->baseHash, pixelShader->auxHash);
 }
 
 void LatteSHRC_UpdateActiveShaders()

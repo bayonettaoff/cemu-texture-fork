@@ -116,6 +116,10 @@ add_library(CemuCafe
   HW/Latte/Core/LatteRenderTarget.cpp
   HW/Latte/Core/LatteTAA.cpp
   HW/Latte/Core/LatteTAA.h
+  HW/Latte/Core/LatteSSAO.cpp
+  HW/Latte/Core/LatteSSAO.h
+  HW/Latte/Core/LatteDLSS.cpp
+  HW/Latte/Core/LatteDLSS.h
   HW/Latte/Core/LatteRingBuffer.cpp
   HW/Latte/Core/LatteRingBuffer.h
   HW/Latte/Core/LatteShaderAssembly.h
@@ -212,6 +216,8 @@ add_library(CemuCafe
   HW/Latte/Renderer/Vulkan/VulkanSurfaceCopy.cpp
   HW/Latte/Renderer/Vulkan/VulkanTAAFilter.cpp
   HW/Latte/Renderer/Vulkan/VulkanTAAFilter.h
+  HW/Latte/Renderer/Vulkan/VulkanSSAOFilter.cpp
+  HW/Latte/Renderer/Vulkan/VulkanSSAOFilter.h
   HW/Latte/Renderer/Vulkan/VulkanTextureReadback.h
   HW/Latte/ShaderInfo/ShaderDescription.cpp
   HW/Latte/ShaderInfo/ShaderInfo.h
@@ -591,4 +597,14 @@ endif()
 
 if(WIN32)
 	target_link_libraries(CemuCafe PRIVATE iphlpapi)
+
+	# DLAA via NVIDIA's real NGX/DLSS SDK (dependencies/DLSS, github.com/NVIDIA/DLSS public repo).
+	# Windows-only for now (no Linux_x86_64 wiring done yet). Purely additive: NGX itself
+	# no-ops gracefully on non-NVIDIA GPUs, so this never affects non-RTX users.
+	target_include_directories(CemuCafe PRIVATE "${CMAKE_SOURCE_DIR}/dependencies/DLSS/include")
+	target_link_libraries(CemuCafe PRIVATE "${CMAKE_SOURCE_DIR}/dependencies/DLSS/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib")
+	target_sources(CemuCafe PRIVATE
+		HW/Latte/Renderer/Vulkan/VulkanDLSSFilter.cpp
+		HW/Latte/Renderer/Vulkan/VulkanDLSSFilter.h
+	)
 endif()

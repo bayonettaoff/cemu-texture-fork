@@ -1,4 +1,4 @@
-#include "gui/wxgui.h"
+﻿#include "gui/wxgui.h"
 #include "gui/MainWindow.h"
 #include "gui/guiWrapper.h"
 
@@ -26,6 +26,8 @@
 #include "gui/LoggingWindow.h"
 #include "config/ActiveSettings.h"
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
+#include "Cafe/HW/Latte/Core/LatteSSAO.h"
+#include "Cafe/HW/Latte/Core/LatteDLSS.h"
 #include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 #include "config/LaunchSettings.h"
 
@@ -148,14 +150,17 @@ enum
 	MAINFRAME_MENU_ID_DEBUG_DUMP_RAM,
 	MAINFRAME_MENU_ID_DEBUG_DUMP_FST,
 	MAINFRAME_MENU_ID_DEBUG_DUMP_CURL_REQUESTS,
-	// debug->taa
+	// debug->anti-aliasing
 	MAINFRAME_MENU_ID_DEBUG_TAA = 21620,
-	MAINFRAME_MENU_ID_DEBUG_TAA_JITTER,
-	MAINFRAME_MENU_ID_DEBUG_TAA_PASSTHROUGH,
+	MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL,
 	// debug->texture replacement
 	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP = 21630,
 	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD,
 	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET,
+	// debug->screen-space effects (one toggle drives HBAO + SSR + contact shadows)
+	MAINFRAME_MENU_ID_DEBUG_SSAO = 21640,
+	// debug->DLAA (NVIDIA NGX/DLSS, real neural-net temporal AA - see LatteDLSS.h)
+	MAINFRAME_MENU_ID_DEBUG_DLAA = 21641,
 	// help
 	MAINFRAME_MENU_ID_HELP_ABOUT = 21700,
 	MAINFRAME_MENU_ID_HELP_UPDATE,
@@ -216,8 +221,9 @@ EVT_MENU(MAINFRAME_MENU_ID_DEBUG_ADVANCED_PPC_INFO, MainWindow::OnPPCInfoToggle)
 // debug -> dump menu
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DUMP_TEXTURES, MainWindow::OnDebugDumpUsedTextures)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA, MainWindow::OnDebugTAAToggle)
-EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA_JITTER, MainWindow::OnDebugTAAJitterToggle)
-EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA_PASSTHROUGH, MainWindow::OnDebugTAAPassthroughToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL, MainWindow::OnDebugTAATemporalToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_SSAO, MainWindow::OnDebugSSAOToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DLAA, MainWindow::OnDebugDLAAToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, MainWindow::OnDebugTexReplaceDumpToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, MainWindow::OnDebugTexReplaceReload)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, MainWindow::OnDebugTexReplaceForget)
@@ -1125,18 +1131,43 @@ void MainWindow::OnDebugTAAToggle(wxCommandEvent& event)
 {
 	LatteTAA::GetConfig().enabled = event.IsChecked();
 	LatteTAA::InvalidateHistory();
+	// menu toggles don't otherwise leave any trace in the log, so there was no
+	// way to confirm from log.txt alone whether a checkbox click "took" without
+	// looking at the menu itself - log every flip
+	cemuLog_log(LogType::Force, "Debug menu: Anti-aliasing FXAA (Vulkan) set to {}", LatteTAA::GetConfig().enabled);
 }
 
-void MainWindow::OnDebugTAAJitterToggle(wxCommandEvent& event)
+// switches the AA pass between single-frame FXAA (default, no history, cannot
+// corrupt) and the temporal resolve (jitter + history blend - the path with
+// the known in-game-cutscene corruption bug, kept around for experimentation
+// since the menu consolidation removed its own toggle in favor of the env var
+// CEMU_TAA_FXAA). Unchecked = FXAA, checked = temporal
+void MainWindow::OnDebugTAATemporalToggle(wxCommandEvent& event)
 {
-	LatteTAA::GetConfig().jitterEnabled = event.IsChecked();
+	LatteTAA::GetConfig().useFxaa = !event.IsChecked();
 	LatteTAA::InvalidateHistory();
+	cemuLog_log(LogType::Force, "Debug menu: TAA temporal resolve set to {} (useFxaa={})", event.IsChecked(), LatteTAA::GetConfig().useFxaa);
 }
 
-void MainWindow::OnDebugTAAPassthroughToggle(wxCommandEvent& event)
+// one menu entry drives the whole screen-space effects pass (HBAO + SSR +
+// SSGI + contact shadows); the per-effect flags and debug views stay reachable
+// through the CEMU_SSAO* / CEMU_SSR* / CEMU_SSGI environment variables
+void MainWindow::OnDebugSSAOToggle(wxCommandEvent& event)
 {
-	LatteTAA::GetConfig().debugPassthrough = event.IsChecked();
-	LatteTAA::InvalidateHistory();
+	auto& config = LatteSSAO::GetConfig();
+	config.enabled = event.IsChecked();
+	config.ssrEnabled = event.IsChecked();
+	config.contactShadowsEnabled = event.IsChecked();
+	config.giEnabled = event.IsChecked();
+	cemuLog_log(LogType::Force, "Debug menu: Screen-space effects set to {}", event.IsChecked());
+}
+
+// DLAA needs TAA's temporal mode (motion vectors) active underneath it - see
+// VulkanDLSSFilter::Apply, which bails if TAA's MV pass didn't run this frame
+void MainWindow::OnDebugDLAAToggle(wxCommandEvent& event)
+{
+	LatteDLSS::GetConfig().enabled = event.IsChecked();
+	cemuLog_log(LogType::Force, "Debug menu: DLAA (NVIDIA NGX) set to {}", event.IsChecked());
 }
 
 void MainWindow::OnDebugTexReplaceDumpToggle(wxCommandEvent& event)
@@ -2054,7 +2085,7 @@ public:
 
 		std::vector<const char*> patreonSupporterNames{ "Maufeat", "lvlv", "F34R", "John Godgames", "Jameel Lewis", "skooks", "Cheesy", "Barrowsx", "Mored1984", "madmat007"
 			, "Kuhnnl", "Owen M", "lucianobugalu", "KimoMaka", "nick palma aka renaissance18", "TheGiantBros", "SpiGAndromeda"
-			, "Chimech0", "Nicolás Pino", "Pezzatti", "Barry Wallace", "REGNR8 Productions", "Lagia", "Freestyler316", "Dentora"
+			, "Chimech0", "NicolÃ¡s Pino", "Pezzatti", "Barry Wallace", "REGNR8 Productions", "Lagia", "Freestyler316", "Dentora"
 			, "tactics", "Merola.C", "Ceigyx", "Mata", "BobSchneeder45", "fenixDG", "jjalapeno55", "FissionMetroid101", "Jetta88"
 			, "nesxdie", "Mikah", "PornfoxVR.com", "Hunter4everosa", "Bbzx", "Salim Sanehi", "FalloutpunkX", "NashOH-CL", "RaheemWala"
 			, "Faris Leonhart", "MahvZero", "PlaguedGuardian", "Stuffie", "CaptainLester", "Qtech", "Zaurexus", "Leonidas", "Artifesto"
@@ -2296,9 +2327,10 @@ void MainWindow::RecreateMenu()
 	auto accurateBarriers = debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_VK_ACCURATE_BARRIERS, _("&Accurate barriers (Vulkan)"), wxEmptyString);
 	accurateBarriers->Check(GetConfig().vk_accurate_barriers);
 
-	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA, _("&TAA experimental (Vulkan)"), wxEmptyString)->Check(LatteTAA::GetConfig().enabled);
-	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA_JITTER, _("TAA: &viewport jitter"), wxEmptyString)->Check(LatteTAA::GetConfig().jitterEnabled);
-	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA_PASSTHROUGH, _("TAA: &current frame only (debug)"), wxEmptyString)->Check(LatteTAA::GetConfig().debugPassthrough);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA, _("&Anti-aliasing FXAA (Vulkan)"), wxEmptyString)->Check(LatteTAA::GetConfig().enabled);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL, _("&TAA: use temporal resolve instead of FXAA (experimental, cutscene corruption known)"), wxEmptyString)->Check(!LatteTAA::GetConfig().useFxaa);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_SSAO, _("&Screen-space effects: HBAO + SSR + SSGI + contact shadows (Vulkan)"), wxEmptyString)->Check(LatteSSAO::AnyEffectEnabled());
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_DLAA, _("&DLAA - real NVIDIA NGX/DLSS (Vulkan, RTX only, needs TAA temporal + jitter)"), wxEmptyString)->Check(LatteDLSS::GetConfig().enabled);
 	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, _("&Textures: dump for replacement (hash)"), wxEmptyString)->Check(LatteTextureReplacement::IsDumpEnabled());
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, _("Textures: &reload replacement folder"), wxEmptyString);
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, _("Textures: &forget replacements (unloads all loaded textures)"), wxEmptyString);

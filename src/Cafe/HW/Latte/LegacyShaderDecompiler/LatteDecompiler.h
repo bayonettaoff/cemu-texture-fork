@@ -204,6 +204,7 @@ struct LatteDecompilerShader
 		sint32 loc_uniformRegister; // uf_uniformRegisterVS/uf_uniformRegisterGS/uf_uniformRegisterPS
 		sint32 count_uniformRegister;
 		sint32 loc_windowSpaceToClipSpaceTransform; // uf_windowSpaceToClipSpaceTransform
+		sint32 loc_taaJitter; // uf_taaJitter - clip-space TAA jitter offset (vertex/geometry only), see LatteTAA::Config::clipSpaceJitter
 		sint32 loc_alphaTestRef; // uf_alphaTestRef
 		sint32 loc_pointSize; // uf_pointSize
 		sint32 loc_fragCoordScale;
@@ -235,6 +236,7 @@ struct LatteDecompilerOutputUniformOffsets
 	sint32 offset_pointSize;
 	sint32 offset_fragCoordScale;
 	sint32 offset_windowSpaceToClipSpaceTransform;
+	sint32 offset_taaJitter;
 	sint32 offset_texScale[LATTE_NUM_MAX_TEX_UNITS];
 	sint32 offset_verticesPerInstance{-1};
 	sint32 offset_streamoutBufferBase[LATTE_NUM_STREAMOUT_BUFFER]{ -1, -1, -1, -1 };
@@ -249,6 +251,7 @@ struct LatteDecompilerOutputUniformOffsets
 		offset_pointSize = -1;
 		offset_fragCoordScale = -1;
 		offset_windowSpaceToClipSpaceTransform = -1;
+		offset_taaJitter = -1;
 		for (sint32 i = 0; i < LATTE_NUM_MAX_TEX_UNITS; i++)
 			offset_texScale[i] = -1;
 		offset_endOfBlock = 0;

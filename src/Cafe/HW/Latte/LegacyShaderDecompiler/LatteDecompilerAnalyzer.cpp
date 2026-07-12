@@ -7,6 +7,7 @@
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompilerInstructions.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
+#include "Cafe/HW/Latte/Core/LatteTAA.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 
 /*
@@ -522,6 +523,14 @@ namespace LatteDecompiler
 
 		if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex && hasAnyViewportScaleDisabled)
 			decompilerContext->hasUniformVarBlock = true; // uf_windowSpaceToClipSpaceTransform
+		// TAA clip-space jitter (see LatteTAA::Config::clipSpaceJitter): depth-independent
+		// replacement for the old viewport-offset jitter, which a real vertex/screen-space
+		// investigation confirmed varies by depth (NVIDIA dev forum: "the offset is different
+		// at different depths, which doesn't help") - matches every real engine's approach of
+		// injecting the offset before the perspective divide instead. Needed by both vertex
+		// and geometry shaders since either can be the one performing the final SET_POSITION
+		if ((decompilerContext->shaderType == LatteConst::ShaderType::Vertex || decompilerContext->shaderType == LatteConst::ShaderType::Geometry) && LatteTAA::GetConfig().clipSpaceJitter)
+			decompilerContext->hasUniformVarBlock = true; // uf_taaJitter
 		bool alphaTestEnable = decompilerContext->contextRegistersNew->SX_ALPHA_TEST_CONTROL.get_ALPHA_TEST_ENABLE();
 		if (decompilerContext->shaderType == LatteConst::ShaderType::Pixel && alphaTestEnable != 0)
 			decompilerContext->hasUniformVarBlock = true; // uf_alphaTestRef

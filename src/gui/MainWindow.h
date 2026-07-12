@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <wx/wx.h>
 #include <wx/dataview.h>
@@ -110,8 +110,9 @@ public:
 	void OnDebugDumpUsedTextures(wxCommandEvent& event);
 	void OnDebugDumpUsedShaders(wxCommandEvent& event);
 	void OnDebugTAAToggle(wxCommandEvent& event);
-	void OnDebugTAAJitterToggle(wxCommandEvent& event);
-	void OnDebugTAAPassthroughToggle(wxCommandEvent& event);
+	void OnDebugTAATemporalToggle(wxCommandEvent& event); // switches FXAA <-> temporal resolve
+	void OnDebugSSAOToggle(wxCommandEvent& event); // all screen-space effects (HBAO+SSR+contact shadows)
+	void OnDebugDLAAToggle(wxCommandEvent& event); // real NVIDIA NGX/DLSS DLAA
 	void OnDebugTexReplaceDumpToggle(wxCommandEvent& event);
 	void OnDebugTexReplaceReload(wxCommandEvent& event);
 	void OnDebugTexReplaceForget(wxCommandEvent& event);

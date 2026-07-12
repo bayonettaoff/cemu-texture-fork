@@ -66,12 +66,17 @@ bool VulkanTAAFilter::CreateShaders()
 		"layout(location = 0) out vec4 outColor;\r\n"
 		"layout(binding = 0) uniform sampler2D texCurrent;\r\n"
 		"layout(binding = 1) uniform sampler2D texHistory;\r\n"
+		"layout(binding = 2) uniform sampler2D texMotionVectors;\r\n" // RG = UV offset from this frame's content to where it was last frame
 		"layout(push_constant) uniform pushConstants {\r\n"
 		"float blendFactor;\r\n"
 		"float historyValid;\r\n"
 		"float jitterUVx;\r\n"
 		"float jitterUVy;\r\n"
 		"float passthrough;\r\n"
+		"float mvSearchStep;\r\n"
+		"float mvRegularization;\r\n"
+		"float useMotionVectors;\r\n"
+		"float mvDebugView;\r\n"
 		"}uf_pc;\r\n"
 		"void main(){\r\n"
 		// sample the current frame at the unjittered position: the viewport shifted
@@ -99,15 +104,153 @@ bool VulkanTAAFilter::CreateShaders()
 		"vec3 sigma = sqrt(max(m2 - m1*m1, vec3(0.0)));\r\n"
 		"vec3 cmin = m1 - sigma;\r\n"
 		"vec3 cmax = m1 + sigma;\r\n"
-		"vec3 histRaw = texture(texHistory, passUV).rgb;\r\n"
+		// reproject history through the estimated motion vector (see the search
+		// pass below) instead of sampling it at the same screen position every
+		// frame - real TAA reprojection instead of pure rejection. Falls back to
+		// the old static sample when disabled (A/B testing, or a game/scene
+		// where the search does more harm than good)
+		"vec2 mv = (uf_pc.useMotionVectors > 0.5) ? texture(texMotionVectors, passUV).rg : vec2(0.0);\r\n"
+		// visualize the raw search output regardless of useMotionVectors, so this
+		// stays useful even while reprojection itself is toggled off. RG: neutral
+		// gray (0.5, 0.5) = no motion found here; scaled 10x so typical small
+		// UV-space motion is actually visible instead of reading as uniform gray
+		// either way. B: the search's own best-match cost (already 0..1-ish, no
+		// rescale needed) - if this shows real scene contrast while RG stays flat
+		// gray, the pass IS running and computing real per-pixel costs, so the
+		// search LOOP itself never improved past the zero-motion seed; if B is
+		// ALSO uniformly near-zero everywhere, current and history are already
+		// nearly identical at every pixel (a real, if surprising, possibility)
+		"if (uf_pc.mvDebugView > 0.5){\r\n"
+		"vec3 mvRaw = texture(texMotionVectors, passUV).rgb;\r\n"
+		"vec2 mvVis = clamp(mvRaw.xy * 10.0 + vec2(0.5), vec2(0.0), vec2(1.0));\r\n"
+		"outColor = vec4(mvVis, clamp(mvRaw.z, 0.0, 1.0), 1.0);\r\n"
+		"return;\r\n"
+		"}\r\n"
+		"vec3 histRaw = texture(texHistory, passUV + mv).rgb;\r\n"
 		"vec3 hist = clamp(histRaw, cmin, cmax);\r\n"
 		// history far outside the current neighborhood means it is stale
-		// (occlusion change, cut, or a skipped draw) -> converge to current fast
+		// (occlusion change, cut, a skipped draw, or the motion search missing) ->
+		// converge to current fast. Unchanged by reprojection: still the safety
+		// net for wrong/low-confidence motion vectors, same as it always was for
+		// a wrong static sample
 		"float clampDist = length(histRaw - hist);\r\n"
 		"float w = clamp(uf_pc.blendFactor + clampDist * 4.0, 0.0, 1.0);\r\n"
 		"vec3 resolved = mix(hist, cur.rgb, w);\r\n"
 		"float keepHistory = uf_pc.historyValid * (1.0 - uf_pc.passthrough);\r\n"
 		"outColor = vec4(mix(cur.rgb, resolved, keepHistory), cur.a);\r\n"
+		"}\r\n";
+
+	// motion vector search: for each half-res output tile, finds the UV offset
+	// where texHistory best matches texCurrent at this pixel - a hierarchical
+	// block search (the technique video codecs use for motion estimation: an
+	// iteratively refined step size instead of one exhaustive search), since
+	// GX2 exposes no per-vertex motion data to read directly (same constraint
+	// behind every other approximation in this fork). Luma-only cost function
+	// on purpose for this first version: no depth plumbing into this filter yet
+	// (TAA has never needed depth before this), and regularizing toward zero
+	// motion already stabilizes flat/low-texture regions without it
+	const char* mvSrc =
+		"#version 450\r\n"
+		"layout(location = 0) in vec2 passUV;\r\n"
+		"layout(location = 0) out vec4 outColor;\r\n"
+		"layout(binding = 0) uniform sampler2D texCurrent;\r\n"
+		"layout(binding = 1) uniform sampler2D texHistory;\r\n"
+		"layout(push_constant) uniform pushConstants {\r\n"
+		"float blendFactor;\r\n"
+		"float historyValid;\r\n"
+		"float jitterUVx;\r\n"
+		"float jitterUVy;\r\n"
+		"float passthrough;\r\n"
+		"float mvSearchStep;\r\n"
+		"float mvRegularization;\r\n"
+		"float useMotionVectors;\r\n"
+		"float mvDebugView;\r\n"
+		"}uf_pc;\r\n"
+		"const vec3 LUMA = vec3(0.299, 0.587, 0.114);\r\n"
+		"void main(){\r\n"
+		// same unjitter as the resolve, so both sides of the comparison are in
+		// stable content-space (history is already unjittered - it is itself a
+		// past resolve's output)
+		"vec2 uvC = passUV + vec2(uf_pc.jitterUVx, uf_pc.jitterUVy);\r\n"
+		"float curLuma = dot(texture(texCurrent, uvC).rgb, LUMA);\r\n"
+		"vec2 best = vec2(0.0);\r\n"
+		"float bestCost = abs(dot(texture(texHistory, passUV).rgb, LUMA) - curLuma);\r\n"
+		"float stepSize = uf_pc.mvSearchStep;\r\n"
+		// per-pixel rotation of the 8 fixed search directions (interleaved
+		// gradient noise, same trick the HBAO/SSR pass in this fork already
+		// uses for exactly this reason): without it, every pixel probes the
+		// SAME 8 axis-aligned directions, so a smoothly varying luma gradient
+		// across a surface "snaps" to a different one of those 8 quantized
+		// directions in a spatially regular way - a moire/banding stripe
+		// pattern, not real motion (confirmed via the debug view: dense,
+		// perfectly regular diagonal stripes, not per-pixel noise)
+		"float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));\r\n"
+		"float rotation = ign * 6.28318530718;\r\n"
+		// 6 iterations of "test 8 neighbors around the current best, keep the
+		// winner, halve the step": ~2x the initial step in total reach, same
+		// tap cost (48 candidates) regardless of how far the true motion is
+		"for (int iter = 0; iter < 6; iter++){\r\n"
+		"vec2 newBest = best;\r\n"
+		"float newCost = bestCost;\r\n"
+		"for (int i = 0; i < 8; i++){\r\n"
+		"float ang = float(i) * 0.78539816340 + rotation;\r\n" // PI/4 steps, rotated per pixel
+		"vec2 cand = best + stepSize * vec2(cos(ang), sin(ang));\r\n"
+		"float hLuma = dot(texture(texHistory, passUV + cand).rgb, LUMA);\r\n"
+		// regularization: ties (common in flat regions) resolve toward less
+		// motion instead of noise, without needing a real confidence signal
+		"float cost = abs(hLuma - curLuma) + uf_pc.mvRegularization * dot(cand, cand);\r\n"
+		"if (cost < newCost){ newCost = cost; newBest = cand; }\r\n"
+		"}\r\n"
+		"best = newBest;\r\n"
+		"bestCost = newCost;\r\n"
+		"stepSize *= 0.5;\r\n"
+		"}\r\n"
+		"outColor = vec4(best, bestCost, 1.0);\r\n"
+		"}\r\n";
+
+	// single-frame FXAA (3.11-style, quality path): the default AA mode. No
+	// history and no jitter, so unlike the temporal resolve it cannot corrupt
+	// anything. Reuses the same descriptor layout (bindings 1/2 unused) and
+	// push constant block (jitterUVx/y carry 1/width, 1/height here)
+	const char* fsFxaaSrc =
+		"#version 450\r\n"
+		"layout(location = 0) in vec2 passUV;\r\n"
+		"layout(location = 0) out vec4 outColor;\r\n"
+		"layout(binding = 0) uniform sampler2D texCurrent;\r\n"
+		"layout(binding = 1) uniform sampler2D texHistory;\r\n"
+		"layout(push_constant) uniform pushConstants {\r\n"
+		"float blendFactor;\r\n"
+		"float historyValid;\r\n"
+		"float jitterUVx;\r\n"
+		"float jitterUVy;\r\n"
+		"float passthrough;\r\n"
+		"float mvSearchStep;\r\n"
+		"float mvRegularization;\r\n"
+		"float useMotionVectors;\r\n"
+		"float mvDebugView;\r\n"
+		"}uf_pc;\r\n"
+		"void main(){\r\n"
+		"vec2 rcpFrame = vec2(uf_pc.jitterUVx, uf_pc.jitterUVy);\r\n"
+		"const vec3 L = vec3(0.299, 0.587, 0.114);\r\n"
+		"vec4 colM = texture(texCurrent, passUV);\r\n"
+		"if (uf_pc.passthrough > 0.5){ outColor = colM; return; }\r\n"
+		"float lumaM = dot(colM.rgb, L);\r\n"
+		"float lumaNW = dot(textureOffset(texCurrent, passUV, ivec2(-1,-1)).rgb, L);\r\n"
+		"float lumaNE = dot(textureOffset(texCurrent, passUV, ivec2( 1,-1)).rgb, L);\r\n"
+		"float lumaSW = dot(textureOffset(texCurrent, passUV, ivec2(-1, 1)).rgb, L);\r\n"
+		"float lumaSE = dot(textureOffset(texCurrent, passUV, ivec2( 1, 1)).rgb, L);\r\n"
+		"float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));\r\n"
+		"float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));\r\n"
+		// early out on flat regions: keeps text/UI crisp and saves bandwidth
+		"if (lumaMax - lumaMin < max(0.0312, lumaMax * 0.125)){ outColor = colM; return; }\r\n"
+		"vec2 dir = vec2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)), ((lumaNW + lumaSW) - (lumaNE + lumaSE)));\r\n"
+		"float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * 0.25 * 0.03125, 0.0078125);\r\n"
+		"float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);\r\n"
+		"dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * rcpFrame;\r\n"
+		"vec3 rgbA = 0.5 * (texture(texCurrent, passUV + dir * (1.0/3.0 - 0.5)).rgb + texture(texCurrent, passUV + dir * (2.0/3.0 - 0.5)).rgb);\r\n"
+		"vec3 rgbB = rgbA * 0.5 + 0.25 * (texture(texCurrent, passUV + dir * -0.5).rgb + texture(texCurrent, passUV + dir * 0.5).rgb);\r\n"
+		"float lumaB = dot(rgbB, L);\r\n"
+		"outColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB, colM.a);\r\n"
 		"}\r\n";
 
 	std::string vsStr(vsSrc);
@@ -118,7 +261,15 @@ bool VulkanTAAFilter::CreateShaders()
 	m_fragmentShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, fsStr);
 	m_fragmentShader->PreponeCompilation(true);
 
-	return m_vertexShader != nullptr && m_fragmentShader != nullptr;
+	std::string fsFxaaStr(fsFxaaSrc);
+	m_fxaaShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, fsFxaaStr);
+	m_fxaaShader->PreponeCompilation(true);
+
+	std::string mvStr(mvSrc);
+	m_mvShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, mvStr);
+	m_mvShader->PreponeCompilation(true);
+
+	return m_vertexShader != nullptr && m_fragmentShader != nullptr && m_fxaaShader != nullptr && m_mvShader != nullptr;
 }
 
 bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
@@ -140,9 +291,10 @@ bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
 		return false;
 	m_sampler->incRef();
 
-	// descriptor set layout: two combined image samplers (fragment)
-	VkDescriptorSetLayoutBinding bindings[2]{};
-	for (uint32 i = 0; i < 2; i++)
+	// descriptor set layout: 0 = current, 1 = history, 2 = motion vectors
+	// (shared by resolve/FXAA/motion-search - see kDescriptorBindings)
+	VkDescriptorSetLayoutBinding bindings[kDescriptorBindings]{};
+	for (uint32 i = 0; i < kDescriptorBindings; i++)
 	{
 		bindings[i].binding = i;
 		bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -151,7 +303,7 @@ bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
 	}
 	VkDescriptorSetLayoutCreateInfo dslInfo{};
 	dslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	dslInfo.bindingCount = 2;
+	dslInfo.bindingCount = kDescriptorBindings;
 	dslInfo.pBindings = bindings;
 	if (vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &m_descriptorSetLayout) != VK_SUCCESS)
 		return false;
@@ -170,10 +322,11 @@ bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
 	if (vkCreatePipelineLayout(device, &plInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS)
 		return false;
 
-	// descriptor pool + ring of sets, updated round-robin each frame
+	// descriptor pool + ring of sets, updated round-robin each frame (2 sets
+	// consumed per Apply() now: the motion search pass and the resolve pass)
 	VkDescriptorPoolSize poolSize{};
 	poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSize.descriptorCount = kDescriptorRingSize * 2;
+	poolSize.descriptorCount = kDescriptorRingSize * kDescriptorBindings;
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.maxSets = kDescriptorRingSize;
@@ -249,6 +402,60 @@ bool VulkanTAAFilter::CreateSizedObjects(VulkanRenderer* renderer)
 		m_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
 	}
 
+	// motion vector target: half resolution (see LatteTAA::Config::useMotionVectors),
+	// RGBA16F because Vulkan doesn't reliably support RGB-only color attachments -
+	// RG = motion vector (UV units), B = best match cost, A unused
+	m_mvWidth = std::max(1, m_width / 2);
+	m_mvHeight = std::max(1, m_height / 2);
+	const VkFormat mvFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+	{
+		VkImageCreateInfo imgInfo{};
+		imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imgInfo.imageType = VK_IMAGE_TYPE_2D;
+		imgInfo.format = mvFormat;
+		imgInfo.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight, 1 };
+		imgInfo.mipLevels = 1;
+		imgInfo.arrayLayers = 1;
+		imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		if (vkCreateImage(device, &imgInfo, nullptr, &m_mvImage) != VK_SUCCESS)
+			return false;
+
+		VkMemoryRequirements memReq;
+		vkGetImageMemoryRequirements(device, m_mvImage, &memReq);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memReq.size;
+		allocInfo.memoryTypeIndex = FindMemoryType(renderer->GetPhysicalDevice(), memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &m_mvMemory) != VK_SUCCESS)
+			return false;
+		vkBindImageMemory(device, m_mvImage, m_mvMemory, 0);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_mvImage;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = mvFormat;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.baseMipLevel = 0;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.baseArrayLayer = 0;
+		viewInfo.subresourceRange.layerCount = 1;
+		VkImageView rawView;
+		if (vkCreateImageView(device, &viewInfo, nullptr, &rawView) != VK_SUCCESS)
+			return false;
+
+		m_mvTexObj = new VKRObjectTexture();
+		m_mvTexObj->m_image = m_mvImage;
+		m_mvTexObj->m_format = mvFormat;
+		m_mvTexObj->m_imageAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+		m_mvViewObj = new VKRObjectTextureView(m_mvTexObj, rawView);
+		m_mvLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	}
+
 	// render pass rendering into a single color attachment of the history format
 	VKRObjectRenderPass::AttachmentInfo_t attachmentInfo{};
 	attachmentInfo.colorAttachment[0].viewObj = m_viewObj[0];
@@ -260,6 +467,13 @@ bool VulkanTAAFilter::CreateSizedObjects(VulkanRenderer* renderer)
 		std::array<VKRObjectTextureView*, 1> fbAttachments{ m_viewObj[i] };
 		m_framebuffer[i] = new VKRObjectFramebuffer(m_renderPass, fbAttachments, Vector2i(m_width, m_height));
 	}
+
+	VKRObjectRenderPass::AttachmentInfo_t mvAttachmentInfo{};
+	mvAttachmentInfo.colorAttachment[0].viewObj = m_mvViewObj;
+	mvAttachmentInfo.colorAttachment[0].format = mvFormat;
+	m_mvRenderPass = new VKRObjectRenderPass(mvAttachmentInfo, 1);
+	std::array<VKRObjectTextureView*, 1> mvFbAttachments{ m_mvViewObj };
+	m_mvFramebuffer = new VKRObjectFramebuffer(m_mvRenderPass, mvFbAttachments, Vector2i(m_mvWidth, m_mvHeight));
 
 	// graphics pipeline (fullscreen triangle, no vertex input, static viewport)
 	VkPipelineShaderStageCreateInfo stages[2]{};
@@ -339,18 +553,35 @@ bool VulkanTAAFilter::CreateSizedObjects(VulkanRenderer* renderer)
 	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipeline) != VK_SUCCESS)
 		return false;
 
+	// second pipeline sharing everything but the fragment shader: FXAA mode
+	stages[1].module = m_fxaaShader->GetShaderModule();
+	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineFxaa) != VK_SUCCESS)
+		return false;
+
+	// third pipeline: motion vector search, targeting the half-res MV render
+	// pass instead. Viewport/scissor are dynamic state (set per-draw in Apply),
+	// so the pipeline's own viewport/scissor counts (already 1/1 above) don't
+	// need to match the half resolution
+	stages[1].module = m_mvShader->GetShaderModule();
+	pipelineInfo.renderPass = m_mvRenderPass->m_renderPass;
+	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineMV) != VK_SUCCESS)
+		return false;
+
 	return true;
 }
 
 void VulkanTAAFilter::ReleaseResources(VulkanRenderer* renderer)
 {
 	m_hasValidOutput = false;
-	// raw handles are deferred a few frames to outlive in-flight command buffers
+	// raw handles are deferred until the GPU has actually finished the command
+	// buffer that last used them (not a guessed frame count - a resize burst
+	// during a loading-screen stall can easily outlast a fixed guess)
+	uint64 releaseCmdBufferId = renderer->GetCurrentCommandBufferId();
 	for (uint32 i = 0; i < 2; i++)
 	{
 		if (m_image[i] != VK_NULL_HANDLE)
 		{
-			m_pendingDeletes.push_back({ m_image[i], m_memory[i], VK_NULL_HANDLE, 8 });
+			m_pendingDeletes.push_back({ m_image[i], m_memory[i], VK_NULL_HANDLE, releaseCmdBufferId });
 			m_image[i] = VK_NULL_HANDLE;
 			m_memory[i] = VK_NULL_HANDLE;
 		}
@@ -379,18 +610,56 @@ void VulkanTAAFilter::ReleaseResources(VulkanRenderer* renderer)
 	}
 	if (m_pipeline != VK_NULL_HANDLE)
 	{
-		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipeline, 8 });
+		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipeline, releaseCmdBufferId });
 		m_pipeline = VK_NULL_HANDLE;
+	}
+	if (m_pipelineFxaa != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipelineFxaa, releaseCmdBufferId });
+		m_pipelineFxaa = VK_NULL_HANDLE;
+	}
+	if (m_mvImage != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ m_mvImage, m_mvMemory, VK_NULL_HANDLE, releaseCmdBufferId });
+		m_mvImage = VK_NULL_HANDLE;
+		m_mvMemory = VK_NULL_HANDLE;
+	}
+	if (m_mvFramebuffer)
+	{
+		renderer->ReleaseDestructibleObject(m_mvFramebuffer);
+		m_mvFramebuffer = nullptr;
+	}
+	if (m_mvViewObj)
+	{
+		renderer->ReleaseDestructibleObject(m_mvViewObj);
+		m_mvViewObj = nullptr;
+	}
+	if (m_mvTexObj)
+	{
+		m_mvTexObj->m_image = VK_NULL_HANDLE;
+		renderer->ReleaseDestructibleObject(m_mvTexObj);
+		m_mvTexObj = nullptr;
+	}
+	m_mvLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (m_mvRenderPass)
+	{
+		renderer->ReleaseDestructibleObject(m_mvRenderPass);
+		m_mvRenderPass = nullptr;
+	}
+	if (m_pipelineMV != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipelineMV, releaseCmdBufferId });
+		m_pipelineMV = VK_NULL_HANDLE;
 	}
 }
 
-void VulkanTAAFilter::TickPendingDeletes(VkDevice device)
+void VulkanTAAFilter::TickPendingDeletes(VulkanRenderer* renderer)
 {
+	VkDevice device = renderer->GetLogicalDevice();
 	for (auto it = m_pendingDeletes.begin(); it != m_pendingDeletes.end();)
 	{
-		if (it->framesLeft > 0)
+		if (!renderer->HasCommandBufferFinished(it->safeCmdBufferId))
 		{
-			it->framesLeft--;
 			++it;
 			continue;
 		}
@@ -445,6 +714,38 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	if (LatteGPUState.drawCallCounter == m_lastDrawCallCounter)
 		return;
 
+	// presents whose draws were only overlays (subtitles, letterbox, fades - no
+	// full-res scene pass) also carry no new scene: 30fps cutscenes at 60Hz
+	// present twice per rendered scene with exactly such draws in between, which
+	// defeated the plain drawCallCounter guard above. Re-resolving there
+	// unjitters the unchanged scene by the already-advanced jitter index and
+	// re-blends it with history; the compounding sub-pixel misalignment was the
+	// cutscene smear/moire corruption (confirmed with automated captures:
+	// passthrough clean, full TAA smeared). The draw-count valve is a safety
+	// net: if a game's scene passes ever elude the heuristic entirely, a burst
+	// of draws still forces a resolve instead of freezing the TAA output
+	// (temporal mode only: FXAA has no history, re-rendering an overlay-only
+	// present is correct and picks up the fresh overlays)
+	const uint32 drawsSinceResolve = LatteGPUState.drawCallCounter - m_lastDrawCallCounter;
+	const uint32 sceneDrawCounter = LatteTAA::GetSceneDrawCounter();
+	if (!config.useFxaa && sceneDrawCounter == m_lastSceneDrawCounter && drawsSinceResolve < 200)
+	{
+		// measure the next present's draw delta from here, so overlay draws don't
+		// accumulate across presents and eventually trip the valve mid-cutscene
+		m_lastDrawCallCounter = LatteGPUState.drawCallCounter;
+		// a LONG run of scene-less presents is not a cutscene overlay gap but a
+		// pure-2D mode (menus, shop, full-screen fades): those redraw fresh 2D
+		// content every present, and holding the last resolve would freeze the
+		// screen there. Step aside and present the raw scanout until scene
+		// geometry returns; half a second of held frame on entering is the
+		// trade-off for not shimmering during 30fps cutscenes
+		m_consecutiveSceneless++;
+		if (m_consecutiveSceneless > 30)
+			m_hasValidOutput = false;
+		return;
+	}
+	m_consecutiveSceneless = 0;
+
 	LatteTextureVk* scanoutTex = (LatteTextureVk*)scanoutView->baseTexture;
 	const uint32 scanMip = (uint32)scanoutView->firstMip;
 	const uint32 scanSlice = (uint32)scanoutView->firstSlice;
@@ -460,7 +761,7 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 		return;
 
 	VkDevice device = renderer->GetLogicalDevice();
-	TickPendingDeletes(device);
+	TickPendingDeletes(renderer);
 
 	// caller (VulkanRenderer::TAA_Apply) has already closed any pending render pass
 	VkCommandBuffer cmd = renderer->TAA_GetCommandBuffer();
@@ -498,25 +799,102 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 					 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 	m_layout[dstIdx] = VK_IMAGE_LAYOUT_GENERAL;
 
-	// update the next descriptor set in the ring
-	VkDescriptorSet descSet = m_descriptorRing[m_descriptorRingIndex];
-	m_descriptorRingIndex = (m_descriptorRingIndex + 1) % kDescriptorRingSize;
-
 	// sample the exact view the present path would use; the base texture's default
 	// view can alias unrelated data (e.g. the game's motion blur intermediates)
 	VKRObjectTextureView* scanoutViewObj = scanoutView->GetViewRGBA();
 	scanoutViewObj->flagForCurrentCommandBuffer();
 	VkImageView scanoutViewRaw = scanoutViewObj->m_textureImageView;
-	VkDescriptorImageInfo imageInfos[2]{};
+
+	float jitterPxX = 0.0f, jitterPxY = 0.0f;
+	LatteTAA::GetCurrentFrameJitter(jitterPxX, jitterPxY);
+	const float jitterUVx = jitterPxX / (float)m_width;
+	const float jitterUVy = jitterPxY / (float)m_height;
+
+	// motion vector search pass: only in temporal mode (FXAA has no history to
+	// reproject). Always runs when temporal, regardless of the useMotionVectors
+	// toggle - that toggle only gates whether the resolve below ACTS on the
+	// result, so A/B testing never has to pay for a different barrier/descriptor
+	// path and the MV texture is never read while genuinely uninitialized
+	if (!config.useFxaa)
+	{
+		m_mvRenderPass->flagForCurrentCommandBuffer();
+		m_mvFramebuffer->flagForCurrentCommandBuffer();
+		m_mvViewObj->flagForCurrentCommandBuffer();
+
+		// about to be fully overwritten as an attachment (same idiom as the
+		// history "dst" barrier above): no need to preserve prior contents
+		_taaBarrierImage(cmd, m_mvImage, m_mvLayout, VK_IMAGE_LAYOUT_GENERAL,
+						 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+						 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+		m_mvLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+		VkDescriptorSet mvDescSet = m_descriptorRing[m_descriptorRingIndex];
+		m_descriptorRingIndex = (m_descriptorRingIndex + 1) % kDescriptorRingSize;
+		// binding 2 (motion vectors) is unused by this shader but still needs a
+		// valid image bound to satisfy the shared layout - reuse the history view
+		VkDescriptorImageInfo mvImageInfos[kDescriptorBindings]{};
+		mvImageInfos[0] = { m_sampler->GetSampler(), scanoutViewRaw, VK_IMAGE_LAYOUT_GENERAL };
+		mvImageInfos[1] = { m_sampler->GetSampler(), m_viewObj[srcIdx]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+		mvImageInfos[2] = { m_sampler->GetSampler(), m_viewObj[srcIdx]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+		VkWriteDescriptorSet mvWrites[kDescriptorBindings]{};
+		for (uint32 i = 0; i < kDescriptorBindings; i++)
+		{
+			mvWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			mvWrites[i].dstSet = mvDescSet;
+			mvWrites[i].dstBinding = i;
+			mvWrites[i].descriptorCount = 1;
+			mvWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			mvWrites[i].pImageInfo = &mvImageInfos[i];
+		}
+		vkUpdateDescriptorSets(device, kDescriptorBindings, mvWrites, 0, nullptr);
+
+		VkRenderPassBeginInfo mvRpBegin{};
+		mvRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		mvRpBegin.renderPass = m_mvRenderPass->m_renderPass;
+		mvRpBegin.framebuffer = m_mvFramebuffer->m_frameBuffer;
+		mvRpBegin.renderArea.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight };
+		vkCmdBeginRenderPass(cmd, &mvRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineMV);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &mvDescSet, 0, nullptr);
+
+		VkViewport mvViewport{ 0.0f, 0.0f, (float)m_mvWidth, (float)m_mvHeight, 0.0f, 1.0f };
+		vkCmdSetViewport(cmd, 0, 1, &mvViewport);
+		VkRect2D mvScissor{ {0, 0}, { (uint32)m_mvWidth, (uint32)m_mvHeight } };
+		vkCmdSetScissor(cmd, 0, 1, &mvScissor);
+
+		PushConstants mvPc{};
+		mvPc.jitterUVx = jitterUVx;
+		mvPc.jitterUVy = jitterUVy;
+		mvPc.mvSearchStep = config.mvSearchStep;
+		mvPc.mvRegularization = config.mvRegularization;
+		vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mvPc), &mvPc);
+		vkCmdDraw(cmd, 3, 1, 0, 0);
+		vkCmdEndRenderPass(cmd);
+
+		_taaBarrierImage(cmd, m_mvImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+						 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+						 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	}
+
+	// update the next descriptor set in the ring
+	VkDescriptorSet descSet = m_descriptorRing[m_descriptorRingIndex];
+	m_descriptorRingIndex = (m_descriptorRingIndex + 1) % kDescriptorRingSize;
+
+	VkDescriptorImageInfo imageInfos[kDescriptorBindings]{};
 	imageInfos[0].sampler = m_sampler->GetSampler();
 	imageInfos[0].imageView = scanoutViewRaw;
 	imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	imageInfos[1].sampler = m_sampler->GetSampler();
 	imageInfos[1].imageView = m_viewObj[srcIdx]->m_textureImageView;
 	imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+	// always bound (even in FXAA mode, where it just holds stale/unused data -
+	// the FXAA shader never samples it and useMotionVectors is forced 0 below)
+	imageInfos[2].sampler = m_sampler->GetSampler();
+	imageInfos[2].imageView = m_mvViewObj->m_textureImageView;
+	imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-	VkWriteDescriptorSet writes[2]{};
-	for (uint32 i = 0; i < 2; i++)
+	VkWriteDescriptorSet writes[kDescriptorBindings]{};
+	for (uint32 i = 0; i < kDescriptorBindings; i++)
 	{
 		writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		writes[i].dstSet = descSet;
@@ -525,7 +903,7 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 		writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 		writes[i].pImageInfo = &imageInfos[i];
 	}
-	vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+	vkUpdateDescriptorSets(device, kDescriptorBindings, writes, 0, nullptr);
 
 	// resolve pass: render blend(current, clamped history) into history[dst]
 	VkRenderPassBeginInfo rpBegin{};
@@ -535,7 +913,7 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	rpBegin.renderArea.extent = { (uint32)m_width, (uint32)m_height };
 	vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, config.useFxaa ? m_pipelineFxaa : m_pipeline);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &descSet, 0, nullptr);
 
 	VkViewport passViewport{};
@@ -561,14 +939,29 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	else if (m_lowFpsHold > 0)
 		m_lowFpsHold--;
 
-	PushConstants pc;
-	pc.blendFactor = (m_lowFpsHold > 0) ? std::max(config.blendFactor, 0.5f) : config.blendFactor;
-	pc.historyValid = LatteTAA::ConsumeHistoryValidFlag() ? 1.0f : 0.0f;
-	pc.passthrough = config.debugPassthrough ? 1.0f : 0.0f;
-	float jitterPxX, jitterPxY;
-	LatteTAA::GetCurrentFrameJitter(jitterPxX, jitterPxY);
-	pc.jitterUVx = jitterPxX / (float)m_width;
-	pc.jitterUVy = jitterPxY / (float)m_height;
+	PushConstants pc{};
+	if (config.useFxaa)
+	{
+		// FXAA repurposes jitterUVx/y as the reciprocal frame size
+		pc.blendFactor = 0.0f;
+		pc.historyValid = 0.0f;
+		pc.passthrough = config.debugPassthrough ? 1.0f : 0.0f;
+		pc.jitterUVx = 1.0f / (float)m_width;
+		pc.jitterUVy = 1.0f / (float)m_height;
+		pc.useMotionVectors = 0.0f;
+	}
+	else
+	{
+		pc.blendFactor = (m_lowFpsHold > 0) ? std::max(config.blendFactor, 0.5f) : config.blendFactor;
+		pc.historyValid = LatteTAA::ConsumeHistoryValidFlag() ? 1.0f : 0.0f;
+		pc.passthrough = config.debugPassthrough ? 1.0f : 0.0f;
+		pc.jitterUVx = jitterUVx;
+		pc.jitterUVy = jitterUVy;
+		pc.useMotionVectors = config.useMotionVectors ? 1.0f : 0.0f;
+	}
+	// meaningful only in temporal mode (FXAA never runs the MV pass, so the
+	// texture would show stale/garbage data there)
+	pc.mvDebugView = (config.mvDebugView && !config.useFxaa) ? 1.0f : 0.0f;
 	vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
 	vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -587,7 +980,9 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	m_currentHistory = dstIdx;
 	m_hasValidOutput = true;
 	m_lastDrawCallCounter = LatteGPUState.drawCallCounter;
-	LatteTAA::NotifyFramePresented();
+	m_lastSceneDrawCounter = sceneDrawCounter;
+	if (!config.useFxaa)
+		LatteTAA::NotifyFramePresented();
 }
 
 VkDescriptorSet VulkanTAAFilter::GetPresentDescriptorSet(VulkanRenderer* renderer, VkDescriptorSetLayout blitLayout,
@@ -648,6 +1043,36 @@ VkDescriptorSet VulkanTAAFilter::GetPresentDescriptorSet(VulkanRenderer* rendere
 	write.pImageInfo = &imageInfo;
 	vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 	return descSet;
+}
+
+VkImageView VulkanTAAFilter::GetResolvedImageViewIfValid(sint32 expectedWidth, sint32 expectedHeight)
+{
+	if (!m_hasValidOutput || expectedWidth != m_width || expectedHeight != m_height)
+		return VK_NULL_HANDLE;
+	if (!m_viewObj[m_currentHistory])
+		return VK_NULL_HANDLE;
+	m_viewObj[m_currentHistory]->flagForCurrentCommandBuffer();
+	return m_viewObj[m_currentHistory]->m_textureImageView;
+}
+
+VkImageView VulkanTAAFilter::GetMotionVectorsViewIfValid(sint32& outWidth, sint32& outHeight, VkImage& outImage)
+{
+	outWidth = 0;
+	outHeight = 0;
+	outImage = VK_NULL_HANDLE;
+	// m_hasValidOutput is only set true at the end of a successful Apply(); the MV
+	// pass always runs there in temporal mode (see its comment in Apply()), so this
+	// implies fresh MV data too. useFxaa is re-checked since FXAA mode never runs
+	// the MV pass at all - m_mvViewObj could be stale from a mode switch.
+	if (!m_hasValidOutput || LatteTAA::GetConfig().useFxaa)
+		return VK_NULL_HANDLE;
+	if (!m_mvViewObj)
+		return VK_NULL_HANDLE;
+	m_mvViewObj->flagForCurrentCommandBuffer();
+	outWidth = m_mvWidth;
+	outHeight = m_mvHeight;
+	outImage = m_mvImage;
+	return m_mvViewObj->m_textureImageView;
 }
 
 void VulkanTAAFilter::Shutdown(VulkanRenderer* renderer)

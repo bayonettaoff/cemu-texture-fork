@@ -13,6 +13,11 @@
 #include "util/containers/flat_hash_map.hpp"
 #include "util/containers/robin_hood.h"
 
+#if BOOST_OS_WINDOWS
+// DLAA (see LatteDLSS.h) - avoid pulling the NGX headers in everywhere just for this pointer member
+struct NVSDK_NGX_Parameter;
+#endif
+
 struct VkSupportedFormatInfo_t
 {
 	bool fmt_d24_unorm_s8_uint{};
@@ -216,6 +221,14 @@ public:
 	// TAA (implemented in VulkanTAAFilter.cpp)
 	void TAA_Apply(LatteTextureView* textureView);
 	VkCommandBuffer TAA_GetCommandBuffer();
+
+	// SSAO (implemented in VulkanSSAOFilter.cpp)
+	void SSAO_Apply(LatteTextureView* textureView);
+	VkCommandBuffer SSAO_GetCommandBuffer();
+
+	// DLAA (implemented in VulkanDLSSFilter.cpp)
+	void DLAA_Apply(LatteTextureView* textureView);
+	VkCommandBuffer DLAA_GetCommandBuffer();
 
 	VkDescriptorPool GetDescriptorPool() const { return m_descriptorPool; }
 
@@ -482,6 +495,11 @@ private:
 		bool debugMarkersSupported{ false }; // frame debugger is attached
 		bool disableMultithreadedCompilation{ false }; // for old nvidia drivers
 
+		// DLAA (see LatteDLSS.h): device extensions NGX itself asks for (queried via
+		// NVSDK_NGX_VULKAN_RequiredExtensions), filtered down to what this device actually
+		// supports. Dynamic, unlike the named flags above, so it can't be a simple bool.
+		std::vector<std::string> ngxDeviceExtensions;
+
 	}m_featureControl{};
 	static bool CheckDeviceExtensionSupport(const VkPhysicalDevice device, FeatureControl& info);
 	static std::vector<const char*> CheckInstanceExtensionSupport(FeatureControl& info);
@@ -580,7 +598,23 @@ private:
 	VkDevice  m_logicalDevice = VK_NULL_HANDLE;
 	VkDebugUtilsMessengerEXT m_debugCallback = nullptr;
 	volatile bool m_destructionRequested = false;
-	
+
+#if BOOST_OS_WINDOWS
+	// DLAA (see LatteDLSS.h) - NVIDIA's real NGX/DLSS runtime, probed once at device creation
+	bool m_ngxInitialized = false;
+	bool m_ngxDLAASupported = false; // NGX initialized AND the driver reports SuperSampling/DLAA as usable on this GPU
+	NVSDK_NGX_Parameter* m_ngxCapabilityParams = nullptr;
+	void InitNGX();
+	void ShutdownNGX();
+public:
+	bool IsDLAAAvailable() const { return m_ngxDLAASupported; }
+private:
+#else
+public:
+	bool IsDLAAAvailable() const { return false; }
+private:
+#endif
+
 	QueueFamilyIndices m_indices{};
 
 	Semaphore m_pipeline_cache_semaphore;

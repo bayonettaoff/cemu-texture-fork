@@ -41,6 +41,19 @@ public:
 	VkDescriptorSet GetPresentDescriptorSet(VulkanRenderer* renderer, VkDescriptorSetLayout blitLayout,
 											sint32 expectedWidth, sint32 expectedHeight);
 
+	// raw view of the latest resolved image, for other filters (SSAO) chaining
+	// after TAA in the same command buffer - already left in a shader-readable
+	// layout by Apply(), no extra barrier needed. Null when there is no valid
+	// output of the expected size.
+	VkImageView GetResolvedImageViewIfValid(sint32 expectedWidth, sint32 expectedHeight);
+
+	// raw view of this frame's motion vector search output (RG = UV-space offset,
+	// see PushConstants comment above), for DLAA (VulkanDLSSFilter) to reuse instead
+	// of running a second block-matching search. Null in FXAA mode (no MV pass runs)
+	// or before the first Apply(). outWidth/outHeight receive the (half-res) dimensions;
+	// outImage receives the raw VkImage backing the view (NGX needs both).
+	VkImageView GetMotionVectorsViewIfValid(sint32& outWidth, sint32& outHeight, VkImage& outImage);
+
 	void Shutdown(VulkanRenderer* renderer);
 
 private:
@@ -60,6 +73,10 @@ private:
 		float jitterUVx; // current-frame viewport jitter in UV units, for unjittering
 		float jitterUVy;
 		float passthrough; // 1.0 = output current frame only (debug)
+		float mvSearchStep; // initial step of the hierarchical motion search (UV units)
+		float mvRegularization; // cost penalty per unit of candidate offset (biases ties toward zero motion)
+		float useMotionVectors; // 1.0 = resolve reprojects history through texMotionVectors, 0.0 = old static sample
+		float mvDebugView; // 1.0 = resolve outputs the motion vector field as color instead of the resolved image
 	};
 
 	// current dimensions/format of the history chain
@@ -77,19 +94,44 @@ private:
 	VKRObjectRenderPass* m_renderPass{};
 	VkPipeline m_pipeline{ VK_NULL_HANDLE };
 
+	// motion vector target (half resolution of the history chain - see
+	// LatteTAA::Config::useMotionVectors). Recomputed fresh every resolve from
+	// the current scanout + previous history, no ping-pong needed
+	sint32 m_mvWidth{ 0 };
+	sint32 m_mvHeight{ 0 };
+	VkImage m_mvImage{ VK_NULL_HANDLE };
+	VkDeviceMemory m_mvMemory{ VK_NULL_HANDLE };
+	VKRObjectTexture* m_mvTexObj{};
+	VKRObjectTextureView* m_mvViewObj{};
+	VKRObjectFramebuffer* m_mvFramebuffer{};
+	VkImageLayout m_mvLayout{ VK_IMAGE_LAYOUT_UNDEFINED };
+	VKRObjectRenderPass* m_mvRenderPass{};
+	VkPipeline m_pipelineMV{ VK_NULL_HANDLE };
+	RendererShaderVk* m_mvShader{};
+
 	// static objects (size-independent)
 	RendererShaderVk* m_vertexShader{};
+	RendererShaderVk* m_fxaaShader{};
+	VkPipeline m_pipelineFxaa{ VK_NULL_HANDLE };
 	RendererShaderVk* m_fragmentShader{};
 	VKRObjectSampler* m_sampler{};
+	// 3 bindings shared by every pipeline (resolve, FXAA, motion vector search):
+	// 0 = current scanout, 1 = history, 2 = motion vectors. A pipeline that
+	// doesn't use one of these still gets a descriptor set with all 3 written
+	// (unused slot filled with the history view) so every set matches the layout
+	static constexpr uint32 kDescriptorBindings = 3;
 	VkDescriptorSetLayout m_descriptorSetLayout{ VK_NULL_HANDLE };
 	VkPipelineLayout m_pipelineLayout{ VK_NULL_HANDLE };
 	VkDescriptorPool m_descriptorPool{ VK_NULL_HANDLE };
-	static constexpr uint32 kDescriptorRingSize = 8;
+	// 2 sets consumed per Apply() now (motion search pass + resolve pass)
+	static constexpr uint32 kDescriptorRingSize = 16;
 	VkDescriptorSet m_descriptorRing[kDescriptorRingSize]{};
 	uint32 m_descriptorRingIndex{ 0 };
 
 	uint32 m_currentHistory{ 0 }; // index holding last frame's resolved image
 	uint32 m_lastDrawCallCounter{ 0xFFFFFFFF }; // detects re-presents without new game draws
+	uint32 m_lastSceneDrawCounter{ 0xFFFFFFFF }; // detects presents whose draws were overlays only (no new scene)
+	uint32 m_consecutiveSceneless{ 0 }; // presents in a row without scene draws; past ~30 = pure-2D mode (menus), present raw
 	bool m_hasValidOutput{ false }; // history[m_currentHistory] holds a presentable resolve
 
 	// low-framerate detection: games with dynamic framerate (30 fps cutscenes /
@@ -111,8 +153,8 @@ private:
 		VkImage image;
 		VkDeviceMemory memory;
 		VkPipeline pipeline;
-		uint32 framesLeft;
+		uint64 safeCmdBufferId; // destroy once VulkanRenderer::HasCommandBufferFinished(safeCmdBufferId)
 	};
 	std::vector<PendingDelete> m_pendingDeletes;
-	void TickPendingDeletes(VkDevice device);
+	void TickPendingDeletes(VulkanRenderer* renderer);
 };

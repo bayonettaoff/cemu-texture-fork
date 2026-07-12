@@ -1,4 +1,4 @@
-#include "Common/precompiled.h"
+﻿#include "Common/precompiled.h"
 #include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 #include "Cafe/HW/Latte/Core/LatteTexture.h"
 #include "Cafe/HW/Latte/Core/LatteTextureLoader.h" // also brings in tga.h (which has no include guard)
@@ -11,6 +11,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <chrono>
 
 // PNG support goes through wxImage; the PNG handler is registered by
 // wxInitAllImageHandlers() during app startup and wxImage file IO is safe off
@@ -24,6 +25,11 @@ namespace LatteTextureReplacement
 	static bool s_indexValid = false;
 	// lowercase filename (without extension) -> full path
 	static std::unordered_map<std::string, fs::path> s_replacementIndex;
+	// "{w}x{h}_fmt{fmt:04x}_slice{s}_mip{m}" (the part of an index name after the
+	// hash) for every indexed entry, so a texture load can check in O(1) whether
+	// ANY replacement could possibly exist for its geometry before paying for a
+	// full-buffer hash of the pixel data
+	static std::unordered_set<std::string> s_candidateSuffixes;
 
 	// filesystem-invalid characters (Windows) replaced with '_'; games with a
 	// ": " subtitle (e.g. some first-party titles) would otherwise break the path
@@ -52,6 +58,142 @@ namespace LatteTextureReplacement
 	static std::mutex s_dumpedMutex;
 	static std::unordered_set<std::string> s_dumpedNames;
 
+	// raw-data fingerprint (FNV over the tiled input bytes, geometry folded in)
+	// -> decoded pixel hash. OnTextureCreated has to know the content hash of
+	// every candidate texture at creation time, which costs a full mip0
+	// untile+decode+hash on the GPU thread; cutscenes stream the same textures
+	// in and out repeatedly, so that cost was being re-paid constantly (the
+	// reported cutscene stuttering, with the GPU itself only ~50% loaded).
+	// Hashing the raw bytes instead is several times cheaper than decoding them
+	// (raw BC data is 1/4 the decoded size and needs no per-texel work), and the
+	// decoded hash is a pure function of raw bytes + geometry, so entries can
+	// never go stale - the cache is only cleared to bound memory (title change /
+	// size cap), never for correctness
+	static std::mutex s_hashCacheMutex;
+	static std::unordered_map<uint64, uint64> s_hashCache;
+
+	// lightweight profiling of the replacement hot paths (all of which run on the
+	// GPU thread): user reports cutscene stuttering with the GPU only ~50% busy,
+	// so whatever is left is CPU time here or elsewhere - log a one-line summary
+	// at most every 10s, and only when the window actually accumulated real work,
+	// to identify the culprit from a live session without a profiler
+	struct PerfBucket
+	{
+		std::atomic<uint64> us{ 0 };
+		std::atomic<uint32> calls{ 0 };
+	};
+	static PerfBucket s_perfCreated, s_perfApply, s_perfUpscale, s_perfDiskRead;
+	struct PerfScope
+	{
+		PerfBucket& bucket;
+		std::chrono::steady_clock::time_point t0;
+		PerfScope(PerfBucket& b) : bucket(b), t0(std::chrono::steady_clock::now()) {}
+		~PerfScope()
+		{
+			bucket.us += (uint64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+			bucket.calls++;
+		}
+	};
+	static void PerfReport()
+	{
+		static std::atomic<uint64> s_lastLogMs{ 0 };
+		const uint64 nowMs = (uint64)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		uint64 last = s_lastLogMs.load();
+		if (nowMs - last < 10000)
+			return;
+		if (!s_lastLogMs.compare_exchange_strong(last, nowMs))
+			return;
+		const uint64 usCreated = s_perfCreated.us.exchange(0);
+		const uint32 nCreated = s_perfCreated.calls.exchange(0);
+		const uint64 usApply = s_perfApply.us.exchange(0);
+		const uint32 nApply = s_perfApply.calls.exchange(0);
+		const uint64 usUpscale = s_perfUpscale.us.exchange(0);
+		const uint32 nUpscale = s_perfUpscale.calls.exchange(0);
+		const uint64 usDisk = s_perfDiskRead.us.exchange(0);
+		const uint32 nDisk = s_perfDiskRead.calls.exchange(0);
+		if (usCreated + usApply + usUpscale < 20000)
+			return; // under 20ms of total work in 10s: irrelevant, don't spam
+		cemuLog_log(LogType::Force, "Texture replacement perf (last 10s, GPU thread): create-hash {}ms/{}x, apply {}ms/{}x, upscale-upload {}ms/{}x (of which disk reads {}ms/{}x)",
+			usCreated / 1000, nCreated, usApply / 1000, nApply, usUpscale / 1000, nUpscale, usDisk / 1000, nDisk);
+	}
+
+	// global LRU cache of replacement file contents (pre-baked DDS mostly),
+	// keyed by path. The file bytes used to be cached inside the per-texture
+	// UpscaleEntry, but that entry dies with its LatteTexture object - and a
+	// cutscene camera cut evicts/recreates the whole scene's textures, so every
+	// cut re-read dozens of multi-MB DDS files from disk on the GPU thread
+	// (reported as "stutter on every camera change"). shared_ptr so a file
+	// still referenced by a live entry survives eviction. Budget defaults to
+	// 1GB, override with CEMU_TEXCACHE_MB
+	struct FileCacheEntry
+	{
+		std::shared_ptr<const std::vector<uint8>> data;
+		uint64 lastUse = 0;
+	};
+	static std::mutex s_fileCacheMutex;
+	static std::unordered_map<std::string, FileCacheEntry> s_fileCache;
+	static size_t s_fileCacheBytes = 0;
+	static uint64 s_fileCacheClock = 0;
+
+	static size_t GetFileCacheBudget()
+	{
+		static const size_t s_budget = []() -> size_t {
+			size_t mb = 1024;
+			if (const char* v = std::getenv("CEMU_TEXCACHE_MB"))
+				mb = (size_t)strtoul(v, nullptr, 10);
+			return mb * 1024ull * 1024ull;
+		}();
+		return s_budget;
+	}
+
+	static std::shared_ptr<const std::vector<uint8>> GetReplacementFileCached(const fs::path& path)
+	{
+		const std::string key = _pathToUtf8(path);
+		{
+			std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+			const auto it = s_fileCache.find(key);
+			if (it != s_fileCache.end())
+			{
+				it->second.lastUse = ++s_fileCacheClock;
+				return it->second.data;
+			}
+		}
+		// read outside the lock; only cache misses pay disk time (tracked separately)
+		std::shared_ptr<std::vector<uint8>> data;
+		{
+			PerfScope perfScope(s_perfDiskRead);
+			data = std::make_shared<std::vector<uint8>>();
+			std::ifstream fileStream(path, std::ios::binary);
+			if (fileStream)
+				data->assign((std::istreambuf_iterator<char>(fileStream)), std::istreambuf_iterator<char>());
+		}
+		const size_t s_budget = GetFileCacheBudget();
+		std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+		FileCacheEntry& entry = s_fileCache[key];
+		if (entry.data) // raced with another insert of the same file
+			s_fileCacheBytes -= entry.data->size();
+		entry.data = data;
+		entry.lastUse = ++s_fileCacheClock;
+		s_fileCacheBytes += data->size();
+		// evict least-recently-used files until under budget (never the one just
+		// inserted - its lastUse is the newest). Linear scan is fine: at most
+		// ~1000 entries and eviction only happens past the 1GB mark
+		while (s_fileCacheBytes > s_budget && s_fileCache.size() > 1)
+		{
+			auto lru = s_fileCache.end();
+			for (auto it = s_fileCache.begin(); it != s_fileCache.end(); ++it)
+			{
+				if (it->first != key && (lru == s_fileCache.end() || it->second.lastUse < lru->second.lastUse))
+					lru = it;
+			}
+			if (lru == s_fileCache.end())
+				break;
+			s_fileCacheBytes -= lru->second.data->size();
+			s_fileCache.erase(lru);
+		}
+		return data;
+	}
+
 	// "<game name> [<16-hex title id>]"; also invalidates the replacement index
 	// on a title change so switching games without restarting Cemu re-scans the
 	// new title's own folder instead of keeping the previous title's index
@@ -64,8 +206,12 @@ namespace LatteTextureReplacement
 			s_lastTitleId = titleId;
 			s_titleSubdir = fmt::format("{} [{:016x}]", SanitizeFilename(CafeSystem::GetForegroundTitleName()), titleId);
 			s_indexValid = false;
-			std::lock_guard<std::mutex> dumpLock(s_dumpedMutex);
-			s_dumpedNames.clear();
+			{
+				std::lock_guard<std::mutex> dumpLock(s_dumpedMutex);
+				s_dumpedNames.clear();
+			}
+			std::lock_guard<std::mutex> hashLock(s_hashCacheMutex);
+			s_hashCache.clear();
 		}
 		return s_titleSubdir;
 	}
@@ -102,6 +248,7 @@ namespace LatteTextureReplacement
 	{
 		s_indexValid = false;
 		s_replacementIndex.clear();
+		s_candidateSuffixes.clear();
 	}
 
 	static std::atomic<bool> s_forgetRequested{false};
@@ -126,6 +273,7 @@ namespace LatteTextureReplacement
 			return;
 		s_indexValid = true;
 		s_replacementIndex.clear();
+		s_candidateSuffixes.clear();
 		std::error_code ec;
 		if (!fs::exists(replaceDir, ec))
 			return;
@@ -139,6 +287,10 @@ namespace LatteTextureReplacement
 				continue;
 			std::string stem = entry.path().stem().string();
 			std::transform(stem.begin(), stem.end(), stem.begin(), ::tolower);
+			// stem is "{hash:016x}_{w}x{h}_fmt{fmt:04x}_slice{s}_mip{m}" (see MakeName);
+			// index the geometry suffix separately so it can be checked without the hash
+			if (stem.size() > 17 && stem[16] == '_')
+				s_candidateSuffixes.insert(stem.substr(17));
 			s_replacementIndex.emplace(std::move(stem), entry.path());
 		}
 		cemuLog_log(LogType::Force, "Texture replacement: indexed {} file(s) in {}", s_replacementIndex.size(), _pathToUtf8(replaceDir));
@@ -160,6 +312,33 @@ namespace LatteTextureReplacement
 			h ^= data[i];
 			h *= 0x100000001b3ull;
 		}
+		return h;
+	}
+
+	// cheap raw-data fingerprint for the hash cache: full FNV of the first 4KB
+	// plus 8 sampled bytes every 512 thereafter, size folded in. A first version
+	// FNV'd the entire raw buffer, which for a streaming burst of multi-MB
+	// textures still added up to visible per-load CPU on the GPU thread; textures
+	// that differ at all differ pervasively (different art), so sparse sampling
+	// keeps the collision risk negligible at ~1/20th the cost
+	static uint64 FingerprintData(const uint8* data, uint32 size)
+	{
+		uint64 h = 0xcbf29ce484222325ull;
+		const uint32 headSize = std::min<uint32>(size, 4096);
+		const uint32 headWords = headSize / 8;
+		const uint64* words = (const uint64*)data;
+		for (uint32 i = 0; i < headWords; i++)
+		{
+			h ^= words[i];
+			h *= 0x100000001b3ull;
+		}
+		for (uint32 offset = 4096; offset + 8 <= size; offset += 512)
+		{
+			h ^= *(const uint64*)(data + offset);
+			h *= 0x100000001b3ull;
+		}
+		h ^= size;
+		h *= 0x100000001b3ull;
 		return h;
 	}
 
@@ -570,7 +749,7 @@ namespace LatteTextureReplacement
 		bool applyLogged = false;
 		// DDS replacements upload their pre-baked mip payloads directly
 		bool isDDS = false;
-		std::vector<uint8> ddsFile; // lazily read
+		std::shared_ptr<const std::vector<uint8>> ddsFile; // from the global file cache, fetched lazily
 		size_t ddsDataOffset = 0;
 		uint32 ddsMipCount = 0;
 	};
@@ -725,9 +904,8 @@ namespace LatteTextureReplacement
 			return;
 		const auto timeStart = now_cached();
 		cemuLog_log(LogType::Force, "Texture replacement: preprocessing {} PNG file(s)...", pngFiles.size());
-		const fs::path excludedNormalDir = fs::path("textureReplace_excluidas") / GetTitleSubdir() / "normalmap";
 		std::atomic<uint32> nextIndex{0};
-		std::atomic<uint32> numAlpha{0}, numNormal{0}, numConverted{0}, numSkipped{0};
+		std::atomic<uint32> numAlpha{0}, numConverted{0}, numSkipped{0};
 
 		auto worker = [&]() {
 			wxLogNull noLog;
@@ -767,7 +945,7 @@ namespace LatteTextureReplacement
 				std::vector<uint8> dumpRGBA;
 				uint32 dumpW = 0, dumpH = 0;
 				{
-					const fs::path dumpPath = dumpDir / fmt::format("{}x{}", origW, origH) / (stem + ".png");
+					const fs::path dumpPath = dumpDir / (stem + ".png");
 					std::error_code ec2;
 					if (fs::exists(dumpPath, ec2) && LoadPNGAsRGBAAnySize(dumpPath, dumpW, dumpH, dumpRGBA))
 						AnalyzeRGBA(dumpRGBA, origAnalysis);
@@ -775,14 +953,6 @@ namespace LatteTextureReplacement
 						dumpRGBA.clear();
 				}
 				std::error_code mec;
-				if (origAnalysis.meanB >= 180 && origAnalysis.meanB >= origAnalysis.meanG + 50 && origAnalysis.meanB >= origAnalysis.meanR + 50)
-				{
-					// normal-map color signature (~RGB 128,127,235): upscaling wrecks these
-					fs::create_directories(excludedNormalDir, mec);
-					fs::rename(path, excludedNormalDir / path.filename(), mec);
-					numNormal++;
-					continue;
-				}
 				if (origAnalysis.alphaMin < 250 && pngAnalysis.alphaMin >= 250 && !dumpRGBA.empty())
 				{
 					// the original has transparency but the upscaler flattened it:
@@ -837,8 +1007,36 @@ namespace LatteTextureReplacement
 			t.join();
 		InvalidateIndex();
 		const uint32 elapsedMs = (uint32)std::chrono::duration_cast<std::chrono::milliseconds>(now_cached() - timeStart).count();
-		cemuLog_log(LogType::Force, "Texture replacement: preprocessing done in {}ms ({} baked to DDS, {} of those with alpha restored from dump, {} excluded as normal map, {} left as-is)",
-					elapsedMs, numConverted.load(), numAlpha.load(), numNormal.load(), numSkipped.load());
+		cemuLog_log(LogType::Force, "Texture replacement: preprocessing done in {}ms ({} baked to DDS, {} of those with alpha restored from dump, {} left as-is)",
+					elapsedMs, numConverted.load(), numAlpha.load(), numSkipped.load());
+
+		// warm the file cache off-thread: with a cold cache the first pass through
+		// a cutscene paid first-touch disk reads on the GPU thread (measured 1.2s
+		// of reads per 10s window in-game) - reading the pack up front on a
+		// background thread makes even the first camera cut serve from RAM.
+		// Detached and budget-capped; worst case it reads files that get evicted
+		// again, which costs nothing on the GPU thread
+		std::thread([replaceDir]() {
+			const size_t stopAt = (size_t)((double)GetFileCacheBudget() * 0.9);
+			std::error_code prefetchEc;
+			for (const auto& entry : fs::directory_iterator(replaceDir, prefetchEc))
+			{
+				if (!entry.is_regular_file(prefetchEc))
+					continue;
+				std::string ext = entry.path().extension().string();
+				std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+				if (ext != ".dds" && ext != ".tga")
+					continue;
+				{
+					std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+					if (s_fileCacheBytes >= stopAt)
+						break;
+				}
+				GetReplacementFileCached(entry.path());
+			}
+			std::lock_guard<std::mutex> lock(s_fileCacheMutex);
+			cemuLog_log(LogType::Force, "Texture replacement: prefetched {} file(s), {} MB in cache", s_fileCache.size(), s_fileCacheBytes / (1024 * 1024));
+		}).detach();
 	}
 
 	void OnTextureCreated(LatteTexture* tex)
@@ -856,20 +1054,11 @@ namespace LatteTextureReplacement
 		BuildIndexIfNeeded();
 		if (s_replacementIndex.empty())
 			return;
-		// cheap pre-filter on geometry/format before paying for an early decode
-		const std::string suffix = fmt::format("_{}x{}_fmt{:04x}_slice0_mip0", tex->width, tex->height, (uint32)tex->format);
-		bool hasCandidate = false;
-		for (const auto& entry : s_replacementIndex)
-		{
-			if (entry.first.size() > suffix.size() &&
-				entry.first.compare(entry.first.size() - suffix.size(), suffix.size(), suffix) == 0)
-			{
-				hasCandidate = true;
-				break;
-			}
-		}
-		if (!hasCandidate)
+		// cheap O(1) pre-filter on geometry/format before paying for an early decode
+		const std::string suffix = fmt::format("{}x{}_fmt{:04x}_slice0_mip0", tex->width, tex->height, (uint32)tex->format);
+		if (!s_candidateSuffixes.count(suffix))
 			return;
+		PerfScope perfScope(s_perfCreated);
 		// decode mip 0 the same way the loader will, to compute the content hash
 		LatteTextureLoaderCtx ctx = {0};
 		LatteTextureLoader_begin(&ctx, 0, 0, tex->physAddress, tex->physMipAddress, tex->format, tex->dim,
@@ -882,9 +1071,44 @@ namespace LatteTextureReplacement
 		const sint32 imageSize = decoder->calculateImageSize(&ctx);
 		if (imageSize <= 0)
 			return;
-		std::vector<uint8> pixelData((size_t)imageSize);
-		decoder->decode(&ctx, pixelData.data());
-		const uint64 hash = HashData(pixelData.data(), (uint32)imageSize);
+		// fingerprint the raw tiled input first and only untile+decode+hash on a
+		// cache miss: the game streaming the same texture back in (constant during
+		// cutscenes) then costs one linear read of the raw bytes instead of the
+		// full per-texel decode that was stalling the GPU thread
+		uint64 hash = 0;
+		bool haveHash = false;
+		uint64 fingerprint = 0;
+		bool haveFingerprint = false;
+		const uint32 rawSize = ctx.computeAddrInfo.sliceBytes;
+		if (ctx.inputData && rawSize > 0 && rawSize <= 0x8000000)
+		{
+			fingerprint = FingerprintData(ctx.inputData, rawSize);
+			// fold the decode geometry in: identical bytes decoded under different
+			// dimensions/format/pitch yield different pixel data. Same key scheme
+			// as Apply() below (slice/mip are 0 here) so mip0 entries are shared
+			fingerprint ^= ((uint64)ctx.width << 48) ^ ((uint64)ctx.height << 32) ^ ((uint64)ctx.pitch << 16) ^ (uint64)tex->format;
+			haveFingerprint = true;
+			std::lock_guard<std::mutex> lock(s_hashCacheMutex);
+			const auto cacheIt = s_hashCache.find(fingerprint);
+			if (cacheIt != s_hashCache.cend())
+			{
+				hash = cacheIt->second;
+				haveHash = true;
+			}
+		}
+		if (!haveHash)
+		{
+			std::vector<uint8> pixelData((size_t)imageSize);
+			decoder->decode(&ctx, pixelData.data());
+			hash = HashData(pixelData.data(), (uint32)imageSize);
+			if (haveFingerprint)
+			{
+				std::lock_guard<std::mutex> lock(s_hashCacheMutex);
+				if (s_hashCache.size() >= 65536) // ~1MB; blunt reset is fine, it refills fast
+					s_hashCache.clear();
+				s_hashCache.emplace(fingerprint, hash);
+			}
+		}
 		const std::string name = MakeName(hash, tex, &ctx, 0, 0);
 		const auto it = s_replacementIndex.find(name);
 		if (it == s_replacementIndex.cend())
@@ -920,7 +1144,7 @@ namespace LatteTextureReplacement
 		entry.isDDS = isDDS;
 		std::unique_lock lock(s_upscaleMutex);
 		s_upscaleMap[tex] = std::move(entry);
-		cemuLog_log(LogType::Force, "Texture replacement: {} upscaled {}x{} -> {}x{}{}", name, tex->width, tex->height, repW, repH, isDDS ? " (DDS)" : "");
+		cemuLog_log(LogType::TextureCache, "Texture replacement: {} upscaled {}x{} -> {}x{}{}", name, tex->width, tex->height, repW, repH, isDDS ? " (DDS)" : "");
 	}
 
 	void OnTextureDeleted(LatteTexture* tex)
@@ -935,6 +1159,7 @@ namespace LatteTextureReplacement
 		const auto it = s_upscaleMap.find(tex);
 		if (it == s_upscaleMap.end())
 			return false;
+		PerfScope perfScope(s_perfUpscale);
 		UpscaleEntry& entry = it->second;
 		if (sliceIndex != 0)
 			return false; // registered textures are single-slice 2D
@@ -942,13 +1167,11 @@ namespace LatteTextureReplacement
 		{
 			// pre-baked DDS: upload the stored mip payload directly, no decode/compress
 			const PayloadKind kind = GetPayloadKind(tex->format);
-			if (entry.ddsFile.empty())
+			if (!entry.ddsFile)
 			{
-				std::ifstream fileStream(entry.path, std::ios::binary);
-				if (fileStream)
-					entry.ddsFile.assign((std::istreambuf_iterator<char>(fileStream)), std::istreambuf_iterator<char>());
+				entry.ddsFile = GetReplacementFileCached(entry.path);
 				DDSInfo info;
-				if (entry.ddsFile.size() < 128 || !ParseDDSHeader(entry.ddsFile, info) || info.kind != kind ||
+				if (entry.ddsFile->size() < 128 || !ParseDDSHeader(*entry.ddsFile, info) || info.kind != kind ||
 					info.width != entry.baseWidth || info.height != entry.baseHeight)
 				{
 					cemuLog_log(LogType::Force, "Texture replacement: {} upscale DDS unreadable or format/size mismatch, texture stays cleared", entry.name);
@@ -956,7 +1179,7 @@ namespace LatteTextureReplacement
 					return false;
 				}
 				entry.ddsDataOffset = info.dataOffset;
-				entry.ddsMipCount = std::max<uint32>(1, *(const uint32*)(entry.ddsFile.data() + 28));
+				entry.ddsMipCount = std::max<uint32>(1, *(const uint32*)(entry.ddsFile->data() + 28));
 			}
 			if (mipIndex >= entry.ddsMipCount)
 			{
@@ -969,7 +1192,7 @@ namespace LatteTextureReplacement
 			for (uint32 lvl = 0; lvl < mipIndex; lvl++)
 				offset += GetLevelPayloadSize(std::max<uint32>(1, entry.baseWidth >> lvl), std::max<uint32>(1, entry.baseHeight >> lvl), kind);
 			const uint32 levelSize = GetLevelPayloadSize(levelW, levelH, kind);
-			if (entry.ddsFile.size() < offset + levelSize)
+			if (entry.ddsFile->size() < offset + levelSize)
 			{
 				cemuLog_log(LogType::Force, "Texture replacement: {} DDS payload truncated at mip {}", entry.name, mipIndex);
 				return false;
@@ -978,17 +1201,17 @@ namespace LatteTextureReplacement
 			{
 				// honor the file's channel masks (third-party DDS may be BGRA)
 				std::vector<uint8> rgbaLevel((size_t)levelW * levelH * 4);
-				CopyDDS32AsRGBA(entry.ddsFile, offset, levelW * levelH, rgbaLevel.data());
+				CopyDDS32AsRGBA(*entry.ddsFile, offset, levelW * levelH, rgbaLevel.data());
 				g_renderer->texture_loadSlice(tex, levelW, levelH, 1, rgbaLevel.data(), sliceIndex, mipIndex, (uint32)rgbaLevel.size());
 			}
 			else
 			{
-				g_renderer->texture_loadSlice(tex, levelW, levelH, 1, (void*)(entry.ddsFile.data() + offset), sliceIndex, mipIndex, levelSize);
+				g_renderer->texture_loadSlice(tex, levelW, levelH, 1, (void*)(entry.ddsFile->data() + offset), sliceIndex, mipIndex, levelSize);
 			}
 			if (!entry.applyLogged)
 			{
 				entry.applyLogged = true;
-				cemuLog_log(LogType::Force, "Texture replacement: applied {} (upscaled to {}x{}, pre-baked DDS)", entry.name, entry.baseWidth, entry.baseHeight);
+				cemuLog_log(LogType::TextureCache, "Texture replacement: applied {} (upscaled to {}x{}, pre-baked DDS)", entry.name, entry.baseWidth, entry.baseHeight);
 			}
 			return true;
 		}
@@ -1034,7 +1257,7 @@ namespace LatteTextureReplacement
 		if (!entry.applyLogged)
 		{
 			entry.applyLogged = true;
-			cemuLog_log(LogType::Force, "Texture replacement: applied {} (upscaled to {}x{})", entry.name, entry.baseWidth, entry.baseHeight);
+			cemuLog_log(LogType::TextureCache, "Texture replacement: applied {} (upscaled to {}x{})", entry.name, entry.baseWidth, entry.baseHeight);
 		}
 		return true;
 	}
@@ -1042,6 +1265,7 @@ namespace LatteTextureReplacement
 	bool Apply(LatteTexture* tex, LatteTextureLoaderCtx* loader, TextureDecoder* decoder,
 			   uint32 sliceIndex, uint32 mipIndex, uint8* pixelData, uint32 imageSize)
 	{
+		PerfReport(); // ~2 atomic reads in the common case; Apply runs on every texture load, ideal report point
 		if (tex->isDepth || imageSize == 0)
 			return false;
 		const PayloadKind kind = GetPayloadKind(tex->format);
@@ -1051,7 +1275,47 @@ namespace LatteTextureReplacement
 		if (s_replacementIndex.empty())
 			return false;
 
-		const uint64 hash = HashData(pixelData, imageSize);
+		// cheap O(1) pre-filter on geometry/format: skip hashing the whole decoded
+		// buffer (the actual cost here, paid by every texture load in the game)
+		// unless a replacement could possibly exist for this exact geometry
+		const std::string suffix = fmt::format("{}x{}_fmt{:04x}_slice{}_mip{}", loader->width, loader->height, (uint32)tex->format, sliceIndex, mipIndex);
+		if (!s_candidateSuffixes.count(suffix))
+			return false;
+		PerfScope perfScope(s_perfApply);
+
+		// same raw-fingerprint cache OnTextureCreated uses: the decode was already
+		// paid by the loader here, but hashing the decoded buffer (4x the raw BC
+		// size) on every reload of the same content is still real per-load cost
+		uint64 hash = 0;
+		bool haveHash = false;
+		uint64 fingerprint = 0;
+		bool haveFingerprint = false;
+		const uint32 rawSize = loader->computeAddrInfo.sliceBytes;
+		if (loader->inputData && rawSize > 0 && rawSize <= 0x8000000)
+		{
+			fingerprint = FingerprintData(loader->inputData, rawSize);
+			fingerprint ^= ((uint64)loader->width << 48) ^ ((uint64)loader->height << 32) ^ ((uint64)loader->pitch << 16) ^ (uint64)tex->format;
+			fingerprint ^= ((uint64)sliceIndex << 12) ^ ((uint64)mipIndex << 8);
+			haveFingerprint = true;
+			std::lock_guard<std::mutex> lock(s_hashCacheMutex);
+			const auto cacheIt = s_hashCache.find(fingerprint);
+			if (cacheIt != s_hashCache.cend())
+			{
+				hash = cacheIt->second;
+				haveHash = true;
+			}
+		}
+		if (!haveHash)
+		{
+			hash = HashData(pixelData, imageSize);
+			if (haveFingerprint)
+			{
+				std::lock_guard<std::mutex> lock(s_hashCacheMutex);
+				if (s_hashCache.size() >= 65536)
+					s_hashCache.clear();
+				s_hashCache.emplace(fingerprint, hash);
+			}
+		}
 		const std::string name = MakeName(hash, tex, loader, sliceIndex, mipIndex);
 		const auto it = s_replacementIndex.find(name);
 		if (it == s_replacementIndex.cend())
@@ -1060,14 +1324,17 @@ namespace LatteTextureReplacement
 		std::string ext = it->second.extension().string();
 		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-		std::vector<uint8> file;
+		// DDS/TGA go through the global file cache so re-streaming the same
+		// texture (every cutscene camera cut) doesn't re-read the file from disk
+		static const std::vector<uint8> s_noFile;
+		std::shared_ptr<const std::vector<uint8>> filePtr;
 		if (ext != ".png") // wxImage reads PNGs straight from the path
 		{
-			std::ifstream fileStream(it->second, std::ios::binary);
-			if (!fileStream)
+			filePtr = GetReplacementFileCached(it->second);
+			if (!filePtr || filePtr->empty())
 				return false;
-			file.assign((std::istreambuf_iterator<char>(fileStream)), std::istreambuf_iterator<char>());
 		}
+		const std::vector<uint8>& file = filePtr ? *filePtr : s_noFile;
 
 		if (ext == ".dds")
 		{
@@ -1128,7 +1395,7 @@ namespace LatteTextureReplacement
 				return false;
 			}
 		}
-		cemuLog_log(LogType::Force, "Texture replacement: applied {}{}", name, ext);
+		cemuLog_log(LogType::TextureCache, "Texture replacement: applied {}{}", name, ext);
 		return true;
 	}
 
@@ -1141,7 +1408,38 @@ namespace LatteTextureReplacement
 			return; // replacements are authored from mip 0 only
 		if (GetPayloadKind(tex->format) == PayloadKind::Unsupported)
 			return;
-		const uint64 hash = HashData(pixelData, imageSize);
+		// same fingerprint->hash cache as Apply/OnTextureCreated, so an enabled
+		// dump toggle doesn't hash the full decoded buffer on every reload either
+		uint64 hash = 0;
+		bool haveHash = false;
+		uint64 fingerprint = 0;
+		bool haveFingerprint = false;
+		const uint32 rawSize = loader->computeAddrInfo.sliceBytes;
+		if (loader->inputData && rawSize > 0 && rawSize <= 0x8000000)
+		{
+			fingerprint = FingerprintData(loader->inputData, rawSize);
+			fingerprint ^= ((uint64)loader->width << 48) ^ ((uint64)loader->height << 32) ^ ((uint64)loader->pitch << 16) ^ (uint64)tex->format;
+			fingerprint ^= ((uint64)sliceIndex << 12) ^ ((uint64)mipIndex << 8);
+			haveFingerprint = true;
+			std::lock_guard<std::mutex> lock(s_hashCacheMutex);
+			const auto cacheIt = s_hashCache.find(fingerprint);
+			if (cacheIt != s_hashCache.cend())
+			{
+				hash = cacheIt->second;
+				haveHash = true;
+			}
+		}
+		if (!haveHash)
+		{
+			hash = HashData(pixelData, imageSize);
+			if (haveFingerprint)
+			{
+				std::lock_guard<std::mutex> lock(s_hashCacheMutex);
+				if (s_hashCache.size() >= 65536)
+					s_hashCache.clear();
+				s_hashCache.emplace(fingerprint, hash);
+			}
+		}
 		const std::string name = MakeName(hash, tex, loader, sliceIndex, mipIndex);
 
 		{
@@ -1151,15 +1449,15 @@ namespace LatteTextureReplacement
 		}
 
 		std::error_code ec;
-		const fs::path dumpSubDir = GetDumpDir() / fmt::format("{}x{}", loader->width, loader->height);
-		const fs::path outPath = dumpSubDir / (name + ".png");
+		const fs::path dumpDir = GetDumpDir();
+		const fs::path outPath = dumpDir / (name + ".png");
 		if (fs::exists(outPath, ec))
 		{
 			std::lock_guard<std::mutex> lock(s_dumpedMutex);
 			s_dumpedNames.insert(name);
 			return; // identical content was already dumped in a previous run
 		}
-		fs::create_directories(dumpSubDir, ec);
+		fs::create_directories(dumpDir, ec);
 
 		// decode to RGBA via the per-pixel decoder (same approach as Cemu's stock dump)
 		std::vector<uint8> rgba((size_t)loader->width * loader->height * 4);
@@ -1188,6 +1486,14 @@ namespace LatteTextureReplacement
 		}
 		wxLogNull noLog;
 		img.SaveFile(outPath.wstring(), wxBITMAP_TYPE_PNG);
+
+		// skip trivially small dumps (flat-color/near-empty textures aren't
+		// worth authoring replacements for and just clutter the dump folder)
+		constexpr uintmax_t kMinDumpSize = 16 * 1024;
+		std::error_code sizeEc;
+		const uintmax_t fileSize = fs::file_size(outPath, sizeEc);
+		if (!sizeEc && fileSize <= kMinDumpSize)
+			fs::remove(outPath, ec);
 
 		std::lock_guard<std::mutex> lock(s_dumpedMutex);
 		s_dumpedNames.insert(name);

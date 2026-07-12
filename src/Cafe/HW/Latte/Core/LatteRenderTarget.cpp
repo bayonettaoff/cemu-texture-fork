@@ -25,6 +25,8 @@ uint32 prevScissorHeight = 0;
 bool hasValidFramebufferAttached = false;
 
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
+#include "Cafe/HW/Latte/Core/LatteSSAO.h"
+#include "Cafe/HW/Latte/Core/LatteDLSS.h"
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanRenderer.h"
 
 struct LatteMRTQuad
@@ -138,6 +140,14 @@ void LatteMRT::SetDepthAndStencilAttachment(LatteTextureView* view, bool hasSten
 {
 	sLatteCurrentRendertargets.depthBuffer.view = view;
 	sLatteCurrentRendertargets.depthBuffer.hasStencil = hasStencil;
+	// let the SSAO/SSR pass capture the scene depth buffer at bind time (the
+	// only reliable moment - by scanout swap the game has usually rebound HUD
+	// targets without depth, and cutscene cuts swap in brand-new depth buffers)
+	if (view)
+	{
+		LatteSSAO::NotifyDepthBind(view);
+		LatteDLSS::NotifyDepthBind(view);
+	}
 }
 
 LatteTextureView* LatteMRT::GetColorAttachment(uint32 index)
@@ -889,6 +899,14 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 	if (!isPadView && LatteTAA::GetConfig().enabled && g_renderer->GetType() == RendererAPI::Vulkan)
 		VulkanRenderer::GetInstance()->TAA_Apply(textureView);
 
+	// DLAA (NVIDIA NGX/DLSS, Vulkan only), chained after TAA - needs its motion vectors
+	if (!isPadView && LatteDLSS::GetConfig().enabled && g_renderer->GetType() == RendererAPI::Vulkan)
+		VulkanRenderer::GetInstance()->DLAA_Apply(textureView);
+
+	// SSAO/SSR fullscreen pass (Vulkan only), chained after TAA/DLAA
+	if (!isPadView && LatteSSAO::AnyEffectEnabled() && g_renderer->GetType() == RendererAPI::Vulkan)
+		VulkanRenderer::GetInstance()->SSAO_Apply(textureView);
+
 	sint32 effectiveWidth, effectiveHeight;
 	textureView->baseTexture->GetEffectiveSize(effectiveWidth, effectiveHeight, 0);
 	_currentOutputImageWidth = effectiveWidth;
@@ -907,6 +925,26 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 	const bool renderUpsideDown = ActiveSettings::RenderUpsideDownEnabled();
 	// force disable bicubic scaling if output resolution is equal/smaller than input resolution
 	const bool downscaling = (imageWidth <= effectiveWidth || imageHeight <= effectiveHeight);
+
+	// TEMP diagnostic (2026-07-12): user suspects the final output-scaling blit
+	// (Bilinear/Bicubic downscale filter, Configuracion general -> Graficos) is
+	// masking DLAA/TAA's contribution at "high resolution" - confirm the ACTUAL
+	// internal render size vs actual window/output size (not the graphic pack's
+	// configured preset, which may not match the real on-screen window pixels
+	// exactly due to OS DPI scaling, borders, etc). Logged only on change.
+	if (!isPadView)
+	{
+		static sint32 s_diagLastEffW = -1, s_diagLastEffH = -1, s_diagLastImgW = -1, s_diagLastImgH = -1;
+		if (effectiveWidth != s_diagLastEffW || effectiveHeight != s_diagLastEffH || imageWidth != s_diagLastImgW || imageHeight != s_diagLastImgH)
+		{
+			cemuLog_log(LogType::Force, "Output scale diag: internal={}x{} output={}x{} downscaling={}",
+				effectiveWidth, effectiveHeight, imageWidth, imageHeight, downscaling);
+			s_diagLastEffW = effectiveWidth;
+			s_diagLastEffH = effectiveHeight;
+			s_diagLastImgW = imageWidth;
+			s_diagLastImgH = imageHeight;
+		}
+	}
 	// check for graphic pack shaders
 	RendererOutputShader* shader = nullptr;
 	LatteTextureView::MagFilter filter = LatteTextureView::MagFilter::kLinear;
@@ -1087,8 +1125,26 @@ void LatteRenderTarget_updateViewport()
 				sLatteRenderTargetState.currentEffectiveSize.height,
 				taaJitterX, taaJitterY))
 		{
-			vpX += taaJitterX;
-			vpY += taaJitterY;
+			if (LatteTAA::GetConfig().clipSpaceJitter)
+			{
+				// depth-independent path (see LatteTAA::Config::clipSpaceJitter):
+				// leave the viewport untouched, the shader decompiler injects the
+				// offset into gl_Position instead. The Vulkan uniform upload
+				// (VulkanRendererCore.cpp, right before the draw) reads this back
+				// and converts it to clip-space units using the same viewport
+				// size this jitter was computed against
+				LatteTAA::SetCurrentDrawJitterPixels(taaJitterX, taaJitterY);
+			}
+			else
+			{
+				vpX += taaJitterX;
+				vpY += taaJitterY;
+				LatteTAA::SetCurrentDrawJitterPixels(0.0f, 0.0f);
+			}
+		}
+		else
+		{
+			LatteTAA::SetCurrentDrawJitterPixels(0.0f, 0.0f);
 		}
 	}
 	g_renderer->renderTarget_setViewport(vpX, vpY, vpWidth, vpHeight, nearZ, farZ, halfZ);

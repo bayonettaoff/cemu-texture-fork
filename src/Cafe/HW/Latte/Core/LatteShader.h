@@ -95,6 +95,18 @@ extern uint64 _shaderBaseHash_vs;
 extern uint64 _shaderBaseHash_gs;
 extern uint64 _shaderBaseHash_ps;
 
+// most-recently-used pixel shaders (see LatteShader.cpp) for the live debug
+// overlay - baseHash/auxHash match the "<baseHash>_<auxHash>_ps.txt" naming
+// of the static shader dump, so a hash read off the overlay can be looked up
+// directly in dump/shaders/
+struct LatteSHRC_RecentPSEntry
+{
+	uint64 baseHash;
+	uint64 auxHash;
+	uint32 hitCount;
+};
+const std::vector<LatteSHRC_RecentPSEntry>& LatteSHRC_GetRecentPixelShaders();
+
 void LatteShader_GetDecompilerOptions(struct LatteDecompilerOptions& options, LatteConst::ShaderType shaderType, bool geometryShaderEnabled);
 LatteDecompilerShader* LatteShader_CreateShaderFromDecompilerOutput(LatteDecompilerOutput_t& decompilerOutput, uint64 baseHash, bool calculateAuxHash, uint64 optionalAuxHash, uint32* contextRegister);
 

@@ -6,6 +6,7 @@
 
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
+#include "Cafe/HW/Latte/Core/LatteTAA.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteIndices.h"
 #include "Cafe/OS/libs/gx2/GX2.h"
@@ -436,6 +437,22 @@ void VulkanRenderer::uniformData_updateUniformVars(uint32 shaderStageIndex, Latt
 			float* v = GET_UNIFORM_DATA_PTR(shader->uniform.loc_windowSpaceToClipSpaceTransform);
 			v[0] = 2.0f / (float)viewportWidth;
 			v[1] = 2.0f / (float)viewportHeight;
+		}
+		if (shader->uniform.loc_taaJitter >= 0)
+		{
+			// LatteRenderTarget_updateViewport already decided (via LatteTAA::GetViewportJitter)
+			// whether this draw should be jittered and stashed the render-target-pixel offset;
+			// convert it to clip-space units here using the exact same viewport-size source as
+			// uf_windowSpaceToClipSpaceTransform above, so both stay consistent with whatever
+			// Y-flip/sign convention this fork's viewport uses
+			sint32 viewportWidth;
+			sint32 viewportHeight;
+			LatteRenderTarget_GetCurrentVirtualViewportSize(&viewportWidth, &viewportHeight);
+			float jitterPxX, jitterPxY;
+			LatteTAA::GetCurrentDrawJitterPixels(jitterPxX, jitterPxY);
+			float* v = GET_UNIFORM_DATA_PTR(shader->uniform.loc_taaJitter);
+			v[0] = jitterPxX * 2.0f / (float)viewportWidth;
+			v[1] = jitterPxY * 2.0f / (float)viewportHeight;
 		}
 		if (shader->uniform.loc_fragCoordScale >= 0)
 		{

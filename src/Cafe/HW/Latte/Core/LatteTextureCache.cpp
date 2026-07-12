@@ -1,6 +1,8 @@
 #include "Cafe/HW/Latte/Core/Latte.h"
 #include "Cafe/HW/Latte/Core/LatteDraw.h"
 #include "Cafe/HW/Latte/Core/LatteTexture.h"
+#include "Cafe/HW/Latte/Core/LatteSSAO.h"
+#include "Cafe/HW/Latte/Core/LatteDLSS.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Common/cpu_features.h"
 
@@ -300,6 +302,8 @@ void LatteTexture_Delete(LatteTexture* texture)
 	LatteTC_UnregisterTexture(texture);
 	LatteMRT::NotifyTextureDeletion(texture);
 	LatteTextureReadback_NotifyTextureDeletion(texture);
+	LatteSSAO::NotifyTextureDeletion(texture);
+	LatteDLSS::NotifyTextureDeletion(texture);
 	LatteTexture_DeleteTextureRelations(texture);
 	// delete views
 	while (!texture->views.empty())

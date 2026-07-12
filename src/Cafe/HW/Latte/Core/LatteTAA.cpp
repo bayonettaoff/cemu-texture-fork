@@ -1,5 +1,6 @@
 #include "Common/precompiled.h"
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
+#include "Cafe/HW/Latte/Core/LatteSSAO.h"
 
 namespace LatteTAA
 {
@@ -16,7 +17,12 @@ namespace LatteTAA
 	Config& GetConfig()
 	{
 		// environment overrides for automated testing (CEMU_TAA=1 forces the
-		// filter on from startup; jitter/passthrough analogous)
+		// filter on from startup; jitter/passthrough analogous). CEMU_TAA_FXAA
+		// switches between the two AA modes the single Debug menu checkbox
+		// shares - useFxaa defaults to true (single-frame, can't corrupt) and
+		// there is no menu item for the temporal resolve path anymore since the
+		// menu consolidation, so this is the only way to reach it without
+		// editing the default in code
 		static bool s_envChecked = false;
 		if (!s_envChecked)
 		{
@@ -27,7 +33,21 @@ namespace LatteTAA
 				s_config.jitterEnabled = (v[0] == '1');
 			if (const char* v = std::getenv("CEMU_TAA_PASSTHROUGH"))
 				s_config.debugPassthrough = (v[0] == '1');
-			cemuLog_log(LogType::Force, "TAA config: enabled={} jitter={} passthrough={}", s_config.enabled, s_config.jitterEnabled, s_config.debugPassthrough);
+			if (const char* v = std::getenv("CEMU_TAA_FXAA"))
+				s_config.useFxaa = (v[0] == '1');
+			if (const char* v = std::getenv("CEMU_TAA_MV"))
+				s_config.useMotionVectors = (v[0] == '1');
+			if (const char* v = std::getenv("CEMU_TAA_MV_STEP"))
+				s_config.mvSearchStep = (float)std::atof(v);
+			if (const char* v = std::getenv("CEMU_TAA_MV_REG"))
+				s_config.mvRegularization = (float)std::atof(v);
+			if (const char* v = std::getenv("CEMU_TAA_MV_DEBUG"))
+				s_config.mvDebugView = (v[0] == '1');
+			if (const char* v = std::getenv("CEMU_TAA_CLIPSPACE_JITTER"))
+				s_config.clipSpaceJitter = (v[0] == '1');
+			cemuLog_log(LogType::Force, "TAA config: enabled={} jitter={} passthrough={} useFxaa={} useMotionVectors={} mvSearchStep={} mvRegularization={} mvDebugView={} clipSpaceJitter={}",
+				s_config.enabled, s_config.jitterEnabled, s_config.debugPassthrough, s_config.useFxaa,
+				s_config.useMotionVectors, s_config.mvSearchStep, s_config.mvRegularization, s_config.mvDebugView, s_config.clipSpaceJitter);
 		}
 		return s_config;
 	}
@@ -48,6 +68,8 @@ namespace LatteTAA
 		s_outputHeight = height;
 	}
 
+	static uint32 s_sceneDrawCounter = 0;
+
 	bool GetViewportJitter(bool depthTestEnabled, bool depthWriteEnabled, bool hasColorBuffer,
 						   float vpWidth, float vpHeight,
 						   sint32 rtWidth, sint32 rtHeight,
@@ -55,7 +77,9 @@ namespace LatteTAA
 	{
 		jitterX = 0.0f;
 		jitterY = 0.0f;
-		if (!s_config.enabled || !s_config.jitterEnabled)
+		// the scene-draw counter also serves the SSAO/SSR pass, so keep
+		// classifying draws while TAA itself is off but those effects are on
+		if (!s_config.enabled && !LatteSSAO::AnyEffectEnabled())
 			return false;
 		// scene pass heuristic: geometry that tests AND writes depth into a color
 		// buffer. Shadow maps are depth-only; UI has no depth test; post-process
@@ -87,17 +111,42 @@ namespace LatteTAA
 			return false;
 		if (rtWidth < (sint32)(0.85f * (float)s_outputWidth) || rtHeight < (sint32)(0.85f * (float)s_outputHeight))
 			return false;
+		// this draw is real full-res scene geometry: mark the frame as carrying a
+		// new scene for the overlay-only-present detection (TAA resolve and
+		// SSAO/SSR pass). Evaluated regardless of the jitter kill-switch
+		s_sceneDrawCounter++;
+		if (!s_config.enabled || !s_config.jitterEnabled || s_config.useFxaa)
+			return false;
 		const uint32 idx = s_frameIndex & 7;
 		jitterX = (s_haltonX[idx] - 0.5f) * s_config.jitterScale;
 		jitterY = (s_haltonY[idx] - 0.5f) * s_config.jitterScale;
 		return true;
 	}
 
+	static float s_currentDrawJitterX = 0.0f;
+	static float s_currentDrawJitterY = 0.0f;
+
+	void SetCurrentDrawJitterPixels(float jitterX, float jitterY)
+	{
+		s_currentDrawJitterX = jitterX;
+		s_currentDrawJitterY = jitterY;
+	}
+
+	void GetCurrentDrawJitterPixels(float& jitterX, float& jitterY)
+	{
+		jitterX = s_currentDrawJitterX;
+		jitterY = s_currentDrawJitterY;
+	}
+
 	void GetCurrentFrameJitter(float& jitterX, float& jitterY)
 	{
 		jitterX = 0.0f;
 		jitterY = 0.0f;
-		if (!s_config.enabled || !s_config.jitterEnabled)
+		// must mirror GetViewportJitter's gate exactly: in FXAA mode no scene pass
+		// is ever jittered (useFxaa forces GetViewportJitter to return false), so
+		// this has to report zero too - otherwise the SSAO/SSR pass "unjitters"
+		// depth by an offset that was never actually applied to the scene
+		if (!s_config.enabled || !s_config.jitterEnabled || s_config.useFxaa)
 			return;
 		const uint32 idx = s_frameIndex & 7;
 		jitterX = (s_haltonX[idx] - 0.5f) * s_config.jitterScale;
@@ -114,5 +163,10 @@ namespace LatteTAA
 		const bool v = s_historyValid;
 		s_historyValid = true;
 		return v;
+	}
+
+	uint32 GetSceneDrawCounter()
+	{
+		return s_sceneDrawCounter;
 	}
 }
