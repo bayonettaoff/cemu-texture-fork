@@ -113,6 +113,7 @@ public:
 	void OnDebugTAATemporalToggle(wxCommandEvent& event); // switches FXAA <-> temporal resolve
 	void OnDebugSSAOToggle(wxCommandEvent& event); // all screen-space effects (HBAO+SSR+contact shadows)
 	void OnDebugDLAAToggle(wxCommandEvent& event); // real NVIDIA NGX/DLSS DLAA
+	void OnDebugOpticalFlowToggle(wxCommandEvent& event); // hardware motion vectors (VK_NV_optical_flow)
 	void OnDebugTexReplaceDumpToggle(wxCommandEvent& event);
 	void OnDebugTexReplaceReload(wxCommandEvent& event);
 	void OnDebugTexReplaceForget(wxCommandEvent& event);

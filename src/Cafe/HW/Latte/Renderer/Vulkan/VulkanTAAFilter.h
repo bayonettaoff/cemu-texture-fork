@@ -77,6 +77,8 @@ private:
 		float mvRegularization; // cost penalty per unit of candidate offset (biases ties toward zero motion)
 		float useMotionVectors; // 1.0 = resolve reprojects history through texMotionVectors, 0.0 = old static sample
 		float mvDebugView; // 1.0 = resolve outputs the motion vector field as color instead of the resolved image
+		float ofFlowScaleX; // UV units per pixel (1/mvWidth), only used by m_pipelineOFConvert
+		float ofFlowScaleY; // 1/mvHeight
 	};
 
 	// current dimensions/format of the history chain
@@ -108,6 +110,109 @@ private:
 	VKRObjectRenderPass* m_mvRenderPass{};
 	VkPipeline m_pipelineMV{ VK_NULL_HANDLE };
 	RendererShaderVk* m_mvShader{};
+
+	// hardware optical flow (VK_NV_optical_flow) - alternative, much higher quality
+	// motion source than the block-matching search above: real GPU-accelerated
+	// motion estimation (RTX Ampere+), purely from the already-rendered current vs
+	// previous frame, no per-game assumptions. Replaces what writes into m_mvImage
+	// when available and enabled (see LatteTAA::Config::useOpticalFlow) - everything
+	// downstream (this filter's own resolve, DLAA) keeps reading m_mvImage unchanged.
+	bool m_ofSessionValid{ false };
+	// set once CreateOpticalFlowSession has been tried and failed for a reason that
+	// won't change without a driver/queue-architecture fix (currently: Cemu's single
+	// graphics queue family lacks VK_QUEUE_OPTICAL_FLOW_BIT_NV on this system/driver -
+	// NVOF commands need a dedicated queue family Cemu doesn't create) - stops Apply()
+	// from retrying (and re-logging) every single frame once we know it can't work
+	bool m_ofUnsupported{ false };
+	VkOpticalFlowSessionNV m_ofSession{ VK_NULL_HANDLE };
+	VkFormat m_ofInputFormat{ VK_FORMAT_UNDEFINED };
+	VkFormat m_ofFlowFormat{ VK_FORMAT_UNDEFINED };
+	VkOpticalFlowGridSizeFlagsNV m_ofGridSize{ VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV };
+
+	// --- cross-queue pipeline state ---
+	// The optical-flow-capable queue family (confirmed via VulkanRenderer::
+	// GetOpticalFlowQueueFamilyIndex) is narrow on NVIDIA hardware: transfer +
+	// optical flow only, no graphics/compute. The "convert scanout to luma" and
+	// "convert flow vector to m_mvImage" passes are fragment shader render passes,
+	// so they MUST run on the graphics queue - only the bare vkCmdOpticalFlowExecuteNV
+	// call runs on the dedicated queue. This means the work is split across two
+	// independently-submitted command buffers with a real cross-queue dependency,
+	// synchronized here via host-side fence polling (checked once per Apply() call)
+	// rather than GPU semaphores, specifically to avoid needing to inject a signal
+	// semaphore into Cemu's own (shared, elsewhere-submitted) per-frame command
+	// buffer submission - this keeps the whole mechanism self-contained in this
+	// filter instead of touching VulkanRenderer's core submission flow. Trade-off:
+	// motion vectors lag by a few frames instead of being perfectly current: the
+	// variance clipping/regularization safety nets already tolerate that.
+	//
+	// 2 color slots, ping-ponged but gated: a slot is only overwritten once it is
+	// no longer needed by an in-flight (or not-yet-consumed) optical flow execute.
+	// With only 2 slots this makes updates bursty (write both, execute, wait for the
+	// full round-trip, repeat) rather than continuous - a known, accepted limitation
+	// of this first version; a deeper ring would smooth it out at the cost of more
+	// image memory and a more involved slot-selection scheme.
+	static constexpr uint32 kOFColorSlots = 2;
+	VkImage m_ofColorImage[kOFColorSlots]{};
+	VkDeviceMemory m_ofColorMemory[kOFColorSlots]{};
+	VKRObjectTexture* m_ofColorTexObj[kOFColorSlots]{};
+	VKRObjectTextureView* m_ofColorViewObj[kOFColorSlots]{};
+	VKRObjectFramebuffer* m_ofColorFramebuffer[kOFColorSlots]{};
+	VkImageLayout m_ofColorLayout[kOFColorSlots]{};
+	VKRObjectRenderPass* m_ofColorRenderPass{}; // shared by both color slots (same format/size)
+	// round-based occupancy: a slot is "occupied" (holds data another stage still
+	// needs) from the moment it's written until the execute consuming it has been
+	// fully converted into m_mvImage (stage 4) - spanning the ready-wait AND the
+	// exec-in-flight period. Both slots of a round free up together in stage 4 and
+	// get refilled together, rather than any single slot being eligible for reuse
+	// the instant it individually becomes "ready" - an earlier version allowed
+	// that and it meant a slot could get overwritten (silently discarding its
+	// just-confirmed-ready data) before stage 3 ever got a chance to pair it with
+	// its partner, so the "both slots ready" condition was never simultaneously
+	// true and no execute ever launched. Round-based occupancy fixes that at the
+	// cost of the bursty (not continuous) update cadence already noted above.
+	bool m_ofColorOccupied[kOFColorSlots]{};
+	bool m_ofColorReady[kOFColorSlots]{}; // true once the graphics-queue write is confirmed done (HasCommandBufferFinished)
+	uint64 m_ofColorCmdBufferId[kOFColorSlots]{}; // Cemu command buffer id captured right after recording slot's conversion pass
+	uint64 m_ofColorWriteSeq[kOFColorSlots]{}; // monotonic write order, to tell which of the 2 ready slots is INPUT (newer) vs REFERENCE (older)
+	uint64 m_ofNextWriteSeq{ 1 };
+
+	VkImage m_ofFlowImage{ VK_NULL_HANDLE };
+	VkDeviceMemory m_ofFlowMemory{ VK_NULL_HANDLE };
+	VKRObjectTexture* m_ofFlowTexObj{};
+	VKRObjectTextureView* m_ofFlowViewObj{};
+	VkImageLayout m_ofFlowLayout{ VK_IMAGE_LAYOUT_UNDEFINED };
+
+	// the dedicated optical-flow queue's own command pool/buffer/fence - entirely
+	// separate from Cemu's per-frame graphics command buffer
+	VkCommandPool m_ofCommandPool{ VK_NULL_HANDLE };
+	VkCommandBuffer m_ofCommandBuffer{ VK_NULL_HANDLE };
+	VkFence m_ofExecFence{ VK_NULL_HANDLE };
+	bool m_ofExecInFlight{ false };
+	uint32 m_ofExecInputSlot{ 0 };
+	uint32 m_ofExecRefSlot{ 0 };
+	// true once the pipeline has produced at least one real result - until then,
+	// Apply() also runs the block-matching search so m_mvImage always holds
+	// something valid; once true, block-matching stops (optical flow drives
+	// m_mvImage exclusively, holding the last result between pipeline updates
+	// rather than mixing two different motion estimators frame to frame)
+	bool m_ofHasEverProducedResult{ false };
+
+	RendererShaderVk* m_ofInputShader{}; // downscale+convert scanout -> m_ofColorImage (luma broadcast)
+	VkPipeline m_pipelineOFInput{ VK_NULL_HANDLE };
+	RendererShaderVk* m_ofConvertShader{}; // NVOF flow vector -> m_mvImage (UV-space RG, matching the block-matching output)
+	VkPipeline m_pipelineOFConvert{ VK_NULL_HANDLE };
+	// VK_FORMAT_R16G16_SFIXED5_NV (the flow vector format) doesn't support linear
+	// filtering (confirmed via Vulkan validation: VUID-vkCmdDraw-magFilter-04553) -
+	// needs its own NEAREST sampler, can't reuse m_sampler (LINEAR, shared by
+	// everything else in this filter). Created once, alongside m_sampler.
+	VKRObjectSampler* m_ofFlowSampler{};
+
+	bool CreateOpticalFlowSession(VulkanRenderer* renderer);
+	void ReleaseOpticalFlowSession(VulkanRenderer* renderer);
+	// runs the cross-queue state machine described above; returns true if
+	// m_mvImage was freshly updated with an optical flow result this call
+	bool UpdateOpticalFlow(VulkanRenderer* renderer, VkCommandBuffer cmd, VkDevice device,
+						   VkImageView scanoutViewRaw, float jitterUVx, float jitterUVy);
 
 	// static objects (size-independent)
 	RendererShaderVk* m_vertexShader{};
@@ -154,6 +259,7 @@ private:
 		VkDeviceMemory memory;
 		VkPipeline pipeline;
 		uint64 safeCmdBufferId; // destroy once VulkanRenderer::HasCommandBufferFinished(safeCmdBufferId)
+		VkOpticalFlowSessionNV ofSession{ VK_NULL_HANDLE }; // appended after safeCmdBufferId so existing 4-arg brace-inits stay valid
 	};
 	std::vector<PendingDelete> m_pendingDeletes;
 	void TickPendingDeletes(VulkanRenderer* renderer);

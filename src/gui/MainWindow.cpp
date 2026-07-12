@@ -161,6 +161,8 @@ enum
 	MAINFRAME_MENU_ID_DEBUG_SSAO = 21640,
 	// debug->DLAA (NVIDIA NGX/DLSS, real neural-net temporal AA - see LatteDLSS.h)
 	MAINFRAME_MENU_ID_DEBUG_DLAA = 21641,
+	// debug->hardware optical flow motion vectors (VK_NV_optical_flow, see LatteTAA.h)
+	MAINFRAME_MENU_ID_DEBUG_OPTICALFLOW = 21642,
 	// help
 	MAINFRAME_MENU_ID_HELP_ABOUT = 21700,
 	MAINFRAME_MENU_ID_HELP_UPDATE,
@@ -224,6 +226,7 @@ EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA, MainWindow::OnDebugTAAToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL, MainWindow::OnDebugTAATemporalToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_SSAO, MainWindow::OnDebugSSAOToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DLAA, MainWindow::OnDebugDLAAToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_OPTICALFLOW, MainWindow::OnDebugOpticalFlowToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, MainWindow::OnDebugTexReplaceDumpToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, MainWindow::OnDebugTexReplaceReload)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, MainWindow::OnDebugTexReplaceForget)
@@ -1168,6 +1171,16 @@ void MainWindow::OnDebugDLAAToggle(wxCommandEvent& event)
 {
 	LatteDLSS::GetConfig().enabled = event.IsChecked();
 	cemuLog_log(LogType::Force, "Debug menu: DLAA (NVIDIA NGX) set to {}", event.IsChecked());
+}
+
+// hardware motion vectors (VK_NV_optical_flow) instead of the block-matching
+// search - see VulkanTAAFilter's cross-queue pipeline; falls back to the
+// block-matching search automatically if this system/driver has no dedicated
+// optical flow queue (logged once, see VulkanTAAFilter::CreateOpticalFlowSession)
+void MainWindow::OnDebugOpticalFlowToggle(wxCommandEvent& event)
+{
+	LatteTAA::GetConfig().useOpticalFlow = event.IsChecked();
+	cemuLog_log(LogType::Force, "Debug menu: hardware optical flow motion vectors set to {}", event.IsChecked());
 }
 
 void MainWindow::OnDebugTexReplaceDumpToggle(wxCommandEvent& event)
@@ -2331,6 +2344,7 @@ void MainWindow::RecreateMenu()
 	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL, _("&TAA: use temporal resolve instead of FXAA (experimental, cutscene corruption known)"), wxEmptyString)->Check(!LatteTAA::GetConfig().useFxaa);
 	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_SSAO, _("&Screen-space effects: HBAO + SSR + SSGI + contact shadows (Vulkan)"), wxEmptyString)->Check(LatteSSAO::AnyEffectEnabled());
 	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_DLAA, _("&DLAA - real NVIDIA NGX/DLSS (Vulkan, RTX only, needs TAA temporal + jitter)"), wxEmptyString)->Check(LatteDLSS::GetConfig().enabled);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_OPTICALFLOW, _("&Motion vectors: hardware optical flow instead of block-matching (Vulkan, RTX Ampere+)"), wxEmptyString)->Check(LatteTAA::GetConfig().useOpticalFlow);
 	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, _("&Textures: dump for replacement (hash)"), wxEmptyString)->Check(LatteTextureReplacement::IsDumpEnabled());
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, _("Textures: &reload replacement folder"), wxEmptyString);
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, _("Textures: &forget replacements (unloads all loaded textures)"), wxEmptyString);

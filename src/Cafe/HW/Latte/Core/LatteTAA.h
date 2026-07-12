@@ -101,6 +101,13 @@ namespace LatteTAA
 		// than just returning near-zero everywhere (which would also look
 		// "clean, no ghosting" - correct-looking for the wrong reason)
 		bool mvDebugView{ false };
+		// hardware optical flow (VK_NV_optical_flow, RTX Ampere+) instead of the
+		// block-matching search above for motion vectors - real GPU-accelerated
+		// motion estimation, purely from the already-rendered frames (no per-game
+		// assumptions, unlike injecting real per-vertex motion would need). Falls
+		// back to the block-matching search when the extension isn't available.
+		// Default off (opt-in, CEMU_TAA_OPTICALFLOW) until validated in-game.
+		bool useOpticalFlow{ false };
 	};
 
 	Config& GetConfig();

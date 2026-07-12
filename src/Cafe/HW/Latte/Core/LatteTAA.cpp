@@ -45,9 +45,11 @@ namespace LatteTAA
 				s_config.mvDebugView = (v[0] == '1');
 			if (const char* v = std::getenv("CEMU_TAA_CLIPSPACE_JITTER"))
 				s_config.clipSpaceJitter = (v[0] == '1');
-			cemuLog_log(LogType::Force, "TAA config: enabled={} jitter={} passthrough={} useFxaa={} useMotionVectors={} mvSearchStep={} mvRegularization={} mvDebugView={} clipSpaceJitter={}",
+			if (const char* v = std::getenv("CEMU_TAA_OPTICALFLOW"))
+				s_config.useOpticalFlow = (v[0] == '1');
+			cemuLog_log(LogType::Force, "TAA config: enabled={} jitter={} passthrough={} useFxaa={} useMotionVectors={} mvSearchStep={} mvRegularization={} mvDebugView={} clipSpaceJitter={} useOpticalFlow={}",
 				s_config.enabled, s_config.jitterEnabled, s_config.debugPassthrough, s_config.useFxaa,
-				s_config.useMotionVectors, s_config.mvSearchStep, s_config.mvRegularization, s_config.mvDebugView, s_config.clipSpaceJitter);
+				s_config.useMotionVectors, s_config.mvSearchStep, s_config.mvRegularization, s_config.mvDebugView, s_config.clipSpaceJitter, s_config.useOpticalFlow);
 		}
 		return s_config;
 	}

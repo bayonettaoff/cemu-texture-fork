@@ -49,6 +49,45 @@ static void _taaBarrierImage(VkCommandBuffer cmd, VkImage image,
 	vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+// synchronization2 variant, needed around VK_NV_optical_flow's execute call: the
+// spec (Vulkan-Docs appendices/VK_NV_optical_flow.adoc) calls for the vendor-
+// specific VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV / VK_ACCESS_2_OPTICAL_FLOW_*_BIT_NV
+// flags, which only exist in the "2" (sync2) flag families - the legacy
+// VkPipelineStageFlagBits/VkAccessFlagBits enums have no equivalent. A first
+// attempt using the legacy API with conservative ALL_COMMANDS/MEMORY_READ|WRITE
+// flags (a normally-safe superset) still produced VK_ERROR_DEVICE_LOST - this
+// vendor extension's hardware queue apparently needs the exact flags, not just a
+// spec-legal superset. Requires renderer->IsOpticalFlowAvailable(), which also
+// gates on synchronization2 support for exactly this reason.
+static void _taaBarrierImage2(VkCommandBuffer cmd, VkImage image,
+							  VkImageLayout oldLayout, VkImageLayout newLayout,
+							  VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess,
+							  VkPipelineStageFlags2 srcStage, VkPipelineStageFlags2 dstStage)
+{
+	VkImageMemoryBarrier2 barrier{};
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.baseMipLevel = 0;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.baseArrayLayer = 0;
+	barrier.subresourceRange.layerCount = 1;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	barrier.srcStageMask = srcStage;
+	barrier.dstStageMask = dstStage;
+
+	VkDependencyInfo depInfo{};
+	depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+	depInfo.imageMemoryBarrierCount = 1;
+	depInfo.pImageMemoryBarriers = &barrier;
+	vkCmdPipelineBarrier2KHR(cmd, &depInfo);
+}
+
 bool VulkanTAAFilter::CreateShaders()
 {
 	const char* vsSrc =
@@ -253,6 +292,75 @@ bool VulkanTAAFilter::CreateShaders()
 		"outColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB, colM.a);\r\n"
 		"}\r\n";
 
+	// hardware optical flow input: downscale+convert the scanout to a luma-broadcast
+	// image in whatever format NVOF wants for INPUT/REFERENCE (queried at runtime -
+	// writing luma to all channels works regardless of whether the format actually
+	// has 1 or more of them, Vulkan only writes the channels the attachment has)
+	const char* ofInputSrc =
+		"#version 450\r\n"
+		"layout(location = 0) in vec2 passUV;\r\n"
+		"layout(location = 0) out vec4 outColor;\r\n"
+		"layout(binding = 0) uniform sampler2D texCurrent;\r\n"
+		"layout(push_constant) uniform pushConstants {\r\n"
+		"float blendFactor;\r\n"
+		"float historyValid;\r\n"
+		"float jitterUVx;\r\n"
+		"float jitterUVy;\r\n"
+		"float passthrough;\r\n"
+		"float mvSearchStep;\r\n"
+		"float mvRegularization;\r\n"
+		"float useMotionVectors;\r\n"
+		"float mvDebugView;\r\n"
+		"float ofFlowScaleX;\r\n"
+		"float ofFlowScaleY;\r\n"
+		"}uf_pc;\r\n"
+		"void main(){\r\n"
+		// same unjitter as the resolve/mv search, so optical flow compares stable
+		// content-space frames instead of jitter noise
+		"vec2 uv = passUV + vec2(uf_pc.jitterUVx, uf_pc.jitterUVy);\r\n"
+		"float luma = dot(texture(texCurrent, uv).rgb, vec3(0.299, 0.587, 0.114));\r\n"
+		"outColor = vec4(luma, luma, luma, 1.0);\r\n"
+		"}\r\n";
+
+	// hardware optical flow output: convert NVOF's flow vector into the same
+	// UV-space RG convention the block-matching search's m_mvImage already uses,
+	// so the resolve pass and DLAA (VulkanDLSSFilter) need zero changes to consume
+	// either source. The flow image's format (VK_FORMAT_R16G16_SFIXED5_NV, queried
+	// at runtime) is its own distinct Vulkan numeric type - NOT SINT despite being
+	// a fixed-point integer storage format, and NOT linear-filterable. Two failed
+	// attempts before this, both confirmed via the Vulkan validation layer
+	// (VK_ERROR_DEVICE_LOST without it, exact VUIDs with it - CEMU_VK_VALIDATION=1):
+	// (1) sampler2D + texture() with the filter's shared LINEAR sampler -> crashed,
+	// VUID-vkCmdDraw-magFilter-04553 (format lacks
+	// SAMPLED_IMAGE_FILTER_LINEAR_BIT); (2) isampler2D + texelFetch -> crashed,
+	// VUID-vkCmdDraw-format-07753 (format's numeric type isn't SINT). Fix: regular
+	// sampler2D + texture(), with a dedicated NEAREST sampler (m_ofFlowSampler) -
+	// the driver converts SFIXED5 to a plain float on sample, same automatic
+	// scaling UNORM/SNORM formats get, so no manual /32 needed.
+	const char* ofConvertSrc =
+		"#version 450\r\n"
+		"layout(location = 0) in vec2 passUV;\r\n"
+		"layout(location = 0) out vec4 outColor;\r\n"
+		"layout(binding = 0) uniform sampler2D texOpticalFlow;\r\n"
+		"layout(push_constant) uniform pushConstants {\r\n"
+		"float blendFactor;\r\n"
+		"float historyValid;\r\n"
+		"float jitterUVx;\r\n"
+		"float jitterUVy;\r\n"
+		"float passthrough;\r\n"
+		"float mvSearchStep;\r\n"
+		"float mvRegularization;\r\n"
+		"float useMotionVectors;\r\n"
+		"float mvDebugView;\r\n"
+		"float ofFlowScaleX;\r\n"
+		"float ofFlowScaleY;\r\n"
+		"}uf_pc;\r\n"
+		"void main(){\r\n"
+		"vec2 flowPixels = texelFetch(texOpticalFlow, ivec2(gl_FragCoord.xy), 0).rg;\r\n"
+		"vec2 flowUV = flowPixels * vec2(uf_pc.ofFlowScaleX, uf_pc.ofFlowScaleY);\r\n"
+		"outColor = vec4(flowUV, 1.0, 1.0);\r\n"
+		"}\r\n";
+
 	std::string vsStr(vsSrc);
 	m_vertexShader = new RendererShaderVk(RendererShader::ShaderType::kVertex, 0, 0, false, false, vsStr);
 	m_vertexShader->PreponeCompilation(true);
@@ -269,7 +377,16 @@ bool VulkanTAAFilter::CreateShaders()
 	m_mvShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, mvStr);
 	m_mvShader->PreponeCompilation(true);
 
-	return m_vertexShader != nullptr && m_fragmentShader != nullptr && m_fxaaShader != nullptr && m_mvShader != nullptr;
+	std::string ofInputStr(ofInputSrc);
+	m_ofInputShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, ofInputStr);
+	m_ofInputShader->PreponeCompilation(true);
+
+	std::string ofConvertStr(ofConvertSrc);
+	m_ofConvertShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, ofConvertStr);
+	m_ofConvertShader->PreponeCompilation(true);
+
+	return m_vertexShader != nullptr && m_fragmentShader != nullptr && m_fxaaShader != nullptr && m_mvShader != nullptr
+		&& m_ofInputShader != nullptr && m_ofConvertShader != nullptr;
 }
 
 bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
@@ -290,6 +407,22 @@ bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
 	if (!m_sampler)
 		return false;
 	m_sampler->incRef();
+
+	// hardware optical flow's output format (VK_FORMAT_R16G16_SFIXED5_NV) doesn't
+	// support linear filtering - see ofConvertSrc's comment. Only ever sampled at
+	// 1:1 texel positions (texelFetch) anyway, so NEAREST costs nothing.
+	VkSamplerCreateInfo ofFlowSamplerInfo{};
+	ofFlowSamplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	ofFlowSamplerInfo.magFilter = VK_FILTER_NEAREST;
+	ofFlowSamplerInfo.minFilter = VK_FILTER_NEAREST;
+	ofFlowSamplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+	ofFlowSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	ofFlowSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	ofFlowSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	m_ofFlowSampler = VKRObjectSampler::GetOrCreateSampler(&ofFlowSamplerInfo);
+	if (!m_ofFlowSampler)
+		return false;
+	m_ofFlowSampler->incRef();
 
 	// descriptor set layout: 0 = current, 1 = history, 2 = motion vectors
 	// (shared by resolve/FXAA/motion-search - see kDescriptorBindings)
@@ -651,6 +784,424 @@ void VulkanTAAFilter::ReleaseResources(VulkanRenderer* renderer)
 		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipelineMV, releaseCmdBufferId });
 		m_pipelineMV = VK_NULL_HANDLE;
 	}
+	ReleaseOpticalFlowSession(renderer);
+}
+
+void VulkanTAAFilter::ReleaseOpticalFlowSession(VulkanRenderer* renderer)
+{
+	VkDevice device = renderer->GetLogicalDevice();
+
+	// the optical flow queue's own command buffer might still be executing on the
+	// GPU (m_ofExecInFlight) when this is called mid-session (e.g. a resize) - wait
+	// for it before tearing down the pool/fence it belongs to. Rare (resize-only),
+	// so a short blocking wait here is an acceptable trade-off for not needing a
+	// second deferred-destruction mechanism just for this one cross-queue case.
+	if (m_ofExecInFlight && m_ofExecFence != VK_NULL_HANDLE)
+		vkWaitForFences(device, 1, &m_ofExecFence, VK_TRUE, UINT64_MAX);
+	m_ofExecInFlight = false;
+
+	if (m_ofExecFence != VK_NULL_HANDLE)
+	{
+		vkDestroyFence(device, m_ofExecFence, nullptr);
+		m_ofExecFence = VK_NULL_HANDLE;
+	}
+	if (m_ofCommandPool != VK_NULL_HANDLE)
+	{
+		vkDestroyCommandPool(device, m_ofCommandPool, nullptr); // also frees m_ofCommandBuffer
+		m_ofCommandPool = VK_NULL_HANDLE;
+		m_ofCommandBuffer = VK_NULL_HANDLE;
+	}
+
+	m_ofSessionValid = false;
+	uint64 releaseCmdBufferId = renderer->GetCurrentCommandBufferId();
+	if (m_ofSession != VK_NULL_HANDLE)
+	{
+		PendingDelete pd{};
+		pd.safeCmdBufferId = releaseCmdBufferId;
+		pd.ofSession = m_ofSession;
+		m_pendingDeletes.push_back(pd);
+		m_ofSession = VK_NULL_HANDLE;
+	}
+	for (uint32 i = 0; i < kOFColorSlots; i++)
+	{
+		m_ofColorOccupied[i] = false;
+		m_ofColorReady[i] = false;
+		m_ofColorCmdBufferId[i] = 0;
+		m_ofColorWriteSeq[i] = 0;
+		if (m_ofColorImage[i] != VK_NULL_HANDLE)
+		{
+			m_pendingDeletes.push_back({ m_ofColorImage[i], m_ofColorMemory[i], VK_NULL_HANDLE, releaseCmdBufferId });
+			m_ofColorImage[i] = VK_NULL_HANDLE;
+			m_ofColorMemory[i] = VK_NULL_HANDLE;
+		}
+		if (m_ofColorFramebuffer[i])
+		{
+			renderer->ReleaseDestructibleObject(m_ofColorFramebuffer[i]);
+			m_ofColorFramebuffer[i] = nullptr;
+		}
+		if (m_ofColorViewObj[i])
+		{
+			renderer->ReleaseDestructibleObject(m_ofColorViewObj[i]);
+			m_ofColorViewObj[i] = nullptr;
+		}
+		if (m_ofColorTexObj[i])
+		{
+			m_ofColorTexObj[i]->m_image = VK_NULL_HANDLE;
+			renderer->ReleaseDestructibleObject(m_ofColorTexObj[i]);
+			m_ofColorTexObj[i] = nullptr;
+		}
+		m_ofColorLayout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+	}
+	if (m_ofColorRenderPass)
+	{
+		renderer->ReleaseDestructibleObject(m_ofColorRenderPass);
+		m_ofColorRenderPass = nullptr;
+	}
+	if (m_ofFlowImage != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ m_ofFlowImage, m_ofFlowMemory, VK_NULL_HANDLE, releaseCmdBufferId });
+		m_ofFlowImage = VK_NULL_HANDLE;
+		m_ofFlowMemory = VK_NULL_HANDLE;
+	}
+	if (m_ofFlowViewObj)
+	{
+		renderer->ReleaseDestructibleObject(m_ofFlowViewObj);
+		m_ofFlowViewObj = nullptr;
+	}
+	if (m_ofFlowTexObj)
+	{
+		m_ofFlowTexObj->m_image = VK_NULL_HANDLE;
+		renderer->ReleaseDestructibleObject(m_ofFlowTexObj);
+		m_ofFlowTexObj = nullptr;
+	}
+	m_ofFlowLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (m_pipelineOFInput != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipelineOFInput, releaseCmdBufferId });
+		m_pipelineOFInput = VK_NULL_HANDLE;
+	}
+	if (m_pipelineOFConvert != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipelineOFConvert, releaseCmdBufferId });
+		m_pipelineOFConvert = VK_NULL_HANDLE;
+	}
+	m_ofNextWriteSeq = 1;
+	m_ofExecInputSlot = 0;
+	m_ofExecRefSlot = 0;
+}
+
+bool VulkanTAAFilter::CreateOpticalFlowSession(VulkanRenderer* renderer)
+{
+	VkDevice device = renderer->GetLogicalDevice();
+	VkPhysicalDevice physDev = renderer->GetPhysicalDevice();
+
+	// vkCmdOpticalFlowExecuteNV (and barriers targeting VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV)
+	// can only be recorded into a command buffer from a queue family that actually
+	// reports VK_QUEUE_OPTICAL_FLOW_BIT_NV - confirmed via the Vulkan validation
+	// layer (VUID-vkCmdPipelineBarrier2-dstStageMask-09676) that Cemu's graphics
+	// queue does NOT have this bit on this system/driver (queue family dump:
+	// graphics=family 0, GRAPHICS|COMPUTE|TRANSFER|SPARSE_BINDING; optical flow=
+	// family 5, TRANSFER|SPARSE_BINDING|OPTICAL_FLOW only - no graphics/compute).
+	// VulkanRenderer requests this queue at device creation time if present (see
+	// its constructor) since queues can't be added to an already-created device.
+	const int32_t ofFamily = renderer->GetOpticalFlowQueueFamilyIndex();
+	VkQueue ofQueue = renderer->GetOpticalFlowQueue();
+	if (ofFamily < 0 || ofQueue == VK_NULL_HANDLE)
+	{
+		cemuLog_log(LogType::Force, "VulkanTAAFilter: no dedicated optical flow queue available on this device - falling back to the block-matching search permanently this session");
+		m_ofUnsupported = true;
+		return false;
+	}
+
+	VkPhysicalDeviceOpticalFlowPropertiesNV ofProps{};
+	ofProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_PROPERTIES_NV;
+	VkPhysicalDeviceProperties2 props2{};
+	props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+	props2.pNext = &ofProps;
+	vkGetPhysicalDeviceProperties2(physDev, &props2);
+
+	if (ofProps.supportedOutputGridSizes & VK_OPTICAL_FLOW_GRID_SIZE_1X1_BIT_NV)
+		m_ofGridSize = VK_OPTICAL_FLOW_GRID_SIZE_1X1_BIT_NV;
+	else if (ofProps.supportedOutputGridSizes & VK_OPTICAL_FLOW_GRID_SIZE_4X4_BIT_NV)
+		m_ofGridSize = VK_OPTICAL_FLOW_GRID_SIZE_4X4_BIT_NV;
+	else if (ofProps.supportedOutputGridSizes & VK_OPTICAL_FLOW_GRID_SIZE_2X2_BIT_NV)
+		m_ofGridSize = VK_OPTICAL_FLOW_GRID_SIZE_2X2_BIT_NV;
+	else if (ofProps.supportedOutputGridSizes & VK_OPTICAL_FLOW_GRID_SIZE_8X8_BIT_NV)
+		m_ofGridSize = VK_OPTICAL_FLOW_GRID_SIZE_8X8_BIT_NV;
+	else
+	{
+		cemuLog_log(LogType::Force, "VulkanTAAFilter: VK_NV_optical_flow reports no usable output grid size");
+		return false;
+	}
+
+	if ((uint32)m_mvWidth < ofProps.minWidth || (uint32)m_mvWidth > ofProps.maxWidth ||
+		(uint32)m_mvHeight < ofProps.minHeight || (uint32)m_mvHeight > ofProps.maxHeight)
+	{
+		cemuLog_log(LogType::Force, "VulkanTAAFilter: optical flow resolution {}x{} outside supported range [{}x{} - {}x{}], falling back to block-matching search",
+			m_mvWidth, m_mvHeight, ofProps.minWidth, ofProps.minHeight, ofProps.maxWidth, ofProps.maxHeight);
+		return false;
+	}
+
+	VkOpticalFlowImageFormatInfoNV inputFormatInfo{};
+	inputFormatInfo.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_IMAGE_FORMAT_INFO_NV;
+	inputFormatInfo.usage = VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV;
+	uint32 formatCount = 0;
+	vkGetPhysicalDeviceOpticalFlowImageFormatsNV(physDev, &inputFormatInfo, &formatCount, nullptr);
+	if (formatCount == 0)
+	{
+		cemuLog_log(LogType::Force, "VulkanTAAFilter: VK_NV_optical_flow reports no input image formats");
+		return false;
+	}
+	std::vector<VkOpticalFlowImageFormatPropertiesNV> inputFormats(formatCount);
+	for (auto& f : inputFormats)
+		f.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_IMAGE_FORMAT_PROPERTIES_NV;
+	vkGetPhysicalDeviceOpticalFlowImageFormatsNV(physDev, &inputFormatInfo, &formatCount, inputFormats.data());
+	m_ofInputFormat = inputFormats[0].format;
+
+	VkOpticalFlowImageFormatInfoNV outputFormatInfo{};
+	outputFormatInfo.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_IMAGE_FORMAT_INFO_NV;
+	outputFormatInfo.usage = VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV;
+	formatCount = 0;
+	vkGetPhysicalDeviceOpticalFlowImageFormatsNV(physDev, &outputFormatInfo, &formatCount, nullptr);
+	if (formatCount == 0)
+	{
+		cemuLog_log(LogType::Force, "VulkanTAAFilter: VK_NV_optical_flow reports no output image formats");
+		return false;
+	}
+	std::vector<VkOpticalFlowImageFormatPropertiesNV> outputFormats(formatCount);
+	for (auto& f : outputFormats)
+		f.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_IMAGE_FORMAT_PROPERTIES_NV;
+	vkGetPhysicalDeviceOpticalFlowImageFormatsNV(physDev, &outputFormatInfo, &formatCount, outputFormats.data());
+	m_ofFlowFormat = outputFormats[0].format;
+
+	cemuLog_log(LogType::Force, "VulkanTAAFilter: VK_NV_optical_flow formats - input={} flowVector={} gridSize={:#x} ({}x{})",
+		(uint32)m_ofInputFormat, (uint32)m_ofFlowFormat, (uint32)m_ofGridSize, m_mvWidth, m_mvHeight);
+
+	VkOpticalFlowSessionCreateInfoNV sessionInfo{};
+	sessionInfo.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV;
+	sessionInfo.width = (uint32)m_mvWidth;
+	sessionInfo.height = (uint32)m_mvHeight;
+	sessionInfo.imageFormat = m_ofInputFormat;
+	sessionInfo.flowVectorFormat = m_ofFlowFormat;
+	sessionInfo.costFormat = VK_FORMAT_UNDEFINED;
+	sessionInfo.outputGridSize = m_ofGridSize;
+	sessionInfo.hintGridSize = 0;
+	// SLOW = highest quality preset (we're not compute-bound by this - the block-
+	// matching search it replaces already cost a full extra pass at this resolution)
+	sessionInfo.performanceLevel = VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_SLOW_NV;
+	sessionInfo.flags = 0; // no hint/cost/global-flow/regions/bidirectional - just plain forward flow
+
+	if (vkCreateOpticalFlowSessionNV(device, &sessionInfo, nullptr, &m_ofSession) != VK_SUCCESS)
+	{
+		cemuLog_log(LogType::Force, "VulkanTAAFilter: vkCreateOpticalFlowSessionNV failed");
+		m_ofSession = VK_NULL_HANDLE;
+		return false;
+	}
+
+	// color slots are written on the graphics queue and read on the optical flow
+	// queue; the flow output (below) is the reverse. CONCURRENT sharing mode avoids
+	// needing explicit queue family ownership transfer barriers for either - a small
+	// tradeoff in access efficiency that doesn't matter for images this size.
+	const uint32 graphicsFamily = (uint32)renderer->GetGraphicsQueueFamilyIndex();
+	const uint32 ofFamilyU32 = (uint32)ofFamily;
+	const uint32 concurrentFamilies[2] = { graphicsFamily, ofFamilyU32 };
+
+	for (uint32 i = 0; i < kOFColorSlots; i++)
+	{
+		VkImageCreateInfo imgInfo{};
+		imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imgInfo.imageType = VK_IMAGE_TYPE_2D;
+		imgInfo.format = m_ofInputFormat;
+		imgInfo.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight, 1 };
+		imgInfo.mipLevels = 1;
+		imgInfo.arrayLayers = 1;
+		imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imgInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		imgInfo.queueFamilyIndexCount = 2;
+		imgInfo.pQueueFamilyIndices = concurrentFamilies;
+		imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		if (vkCreateImage(device, &imgInfo, nullptr, &m_ofColorImage[i]) != VK_SUCCESS)
+			return false;
+		VkMemoryRequirements memReq;
+		vkGetImageMemoryRequirements(device, m_ofColorImage[i], &memReq);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memReq.size;
+		allocInfo.memoryTypeIndex = FindMemoryType(physDev, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &m_ofColorMemory[i]) != VK_SUCCESS)
+			return false;
+		vkBindImageMemory(device, m_ofColorImage[i], m_ofColorMemory[i], 0);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_ofColorImage[i];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = m_ofInputFormat;
+		viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		VkImageView rawView;
+		if (vkCreateImageView(device, &viewInfo, nullptr, &rawView) != VK_SUCCESS)
+			return false;
+
+		m_ofColorTexObj[i] = new VKRObjectTexture();
+		m_ofColorTexObj[i]->m_image = m_ofColorImage[i];
+		m_ofColorTexObj[i]->m_format = m_ofInputFormat;
+		m_ofColorTexObj[i]->m_imageAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+		m_ofColorViewObj[i] = new VKRObjectTextureView(m_ofColorTexObj[i], rawView);
+		m_ofColorLayout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+	}
+
+	{
+		VkImageCreateInfo imgInfo{};
+		imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imgInfo.imageType = VK_IMAGE_TYPE_2D;
+		imgInfo.format = m_ofFlowFormat;
+		imgInfo.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight, 1 };
+		imgInfo.mipLevels = 1;
+		imgInfo.arrayLayers = 1;
+		imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imgInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT; // NVOF writes it internally, we only sample afterward
+		imgInfo.sharingMode = VK_SHARING_MODE_CONCURRENT; // written by the OF queue, read by the graphics queue
+		imgInfo.queueFamilyIndexCount = 2;
+		imgInfo.pQueueFamilyIndices = concurrentFamilies;
+		imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		if (vkCreateImage(device, &imgInfo, nullptr, &m_ofFlowImage) != VK_SUCCESS)
+			return false;
+		VkMemoryRequirements memReq;
+		vkGetImageMemoryRequirements(device, m_ofFlowImage, &memReq);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memReq.size;
+		allocInfo.memoryTypeIndex = FindMemoryType(physDev, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &m_ofFlowMemory) != VK_SUCCESS)
+			return false;
+		vkBindImageMemory(device, m_ofFlowImage, m_ofFlowMemory, 0);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_ofFlowImage;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = m_ofFlowFormat;
+		viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		VkImageView rawView;
+		if (vkCreateImageView(device, &viewInfo, nullptr, &rawView) != VK_SUCCESS)
+			return false;
+
+		m_ofFlowTexObj = new VKRObjectTexture();
+		m_ofFlowTexObj->m_image = m_ofFlowImage;
+		m_ofFlowTexObj->m_format = m_ofFlowFormat;
+		m_ofFlowTexObj->m_imageAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+		m_ofFlowViewObj = new VKRObjectTextureView(m_ofFlowTexObj, rawView);
+		m_ofFlowLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	}
+
+	VKRObjectRenderPass::AttachmentInfo_t ofColorAttachmentInfo{};
+	ofColorAttachmentInfo.colorAttachment[0].viewObj = m_ofColorViewObj[0];
+	ofColorAttachmentInfo.colorAttachment[0].format = m_ofInputFormat;
+	m_ofColorRenderPass = new VKRObjectRenderPass(ofColorAttachmentInfo, 1);
+	for (uint32 i = 0; i < kOFColorSlots; i++)
+	{
+		std::array<VKRObjectTextureView*, 1> fbAttachments{ m_ofColorViewObj[i] };
+		m_ofColorFramebuffer[i] = new VKRObjectFramebuffer(m_ofColorRenderPass, fbAttachments, Vector2i(m_mvWidth, m_mvHeight));
+	}
+
+	VkPipelineShaderStageCreateInfo stages[2]{};
+	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = m_vertexShader->GetShaderModule();
+	stages[0].pName = "main";
+	stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].pName = "main";
+
+	VkPipelineVertexInputStateCreateInfo vertexInput{};
+	vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+	VkViewport ofViewport{ 0.0f, 0.0f, (float)m_mvWidth, (float)m_mvHeight, 0.0f, 1.0f };
+	VkRect2D ofScissor{ {0, 0}, { (uint32)m_mvWidth, (uint32)m_mvHeight } };
+	VkPipelineViewportStateCreateInfo viewportState{};
+	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.pViewports = &ofViewport;
+	viewportState.scissorCount = 1;
+	viewportState.pScissors = &ofScissor;
+	VkPipelineRasterizationStateCreateInfo rasterizer{};
+	rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+	rasterizer.cullMode = VK_CULL_MODE_NONE;
+	rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	rasterizer.lineWidth = 1.0f;
+	VkPipelineMultisampleStateCreateInfo multisampling{};
+	multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+	VkPipelineColorBlendAttachmentState blendAttachment{};
+	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+	VkPipelineColorBlendStateCreateInfo colorBlending{};
+	colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+	colorBlending.attachmentCount = 1;
+	colorBlending.pAttachments = &blendAttachment;
+	VkDynamicState dynamicStates[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo dynamicState{};
+	dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamicState.dynamicStateCount = 2;
+	dynamicState.pDynamicStates = dynamicStates;
+
+	VkGraphicsPipelineCreateInfo pipelineInfo{};
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	pipelineInfo.stageCount = 2;
+	pipelineInfo.pStages = stages;
+	pipelineInfo.pVertexInputState = &vertexInput;
+	pipelineInfo.pInputAssemblyState = &inputAssembly;
+	pipelineInfo.pViewportState = &viewportState;
+	pipelineInfo.pRasterizationState = &rasterizer;
+	pipelineInfo.pMultisampleState = &multisampling;
+	pipelineInfo.pColorBlendState = &colorBlending;
+	pipelineInfo.pDynamicState = &dynamicState;
+	pipelineInfo.layout = m_pipelineLayout;
+	pipelineInfo.renderPass = m_ofColorRenderPass->m_renderPass;
+	pipelineInfo.subpass = 0;
+
+	stages[1].module = m_ofInputShader->GetShaderModule();
+	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOFInput) != VK_SUCCESS)
+		return false;
+
+	// reuse m_mvRenderPass for the convert-to-m_mvImage pipeline: same format/size
+	// as the block-matching output, that's the whole point (downstream consumers -
+	// this filter's own resolve, DLAA - don't need to know which source produced it)
+	stages[1].module = m_ofConvertShader->GetShaderModule();
+	pipelineInfo.renderPass = m_mvRenderPass->m_renderPass;
+	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineOFConvert) != VK_SUCCESS)
+		return false;
+
+	// dedicated command pool/buffer/fence for the optical flow queue - entirely
+	// separate from Cemu's per-frame graphics command buffer (see UpdateOpticalFlow)
+	VkCommandPoolCreateInfo cmdPoolInfo{};
+	cmdPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+	cmdPoolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	cmdPoolInfo.queueFamilyIndex = ofFamilyU32;
+	if (vkCreateCommandPool(device, &cmdPoolInfo, nullptr, &m_ofCommandPool) != VK_SUCCESS)
+		return false;
+
+	VkCommandBufferAllocateInfo cmdAllocInfo{};
+	cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	cmdAllocInfo.commandPool = m_ofCommandPool;
+	cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	cmdAllocInfo.commandBufferCount = 1;
+	if (vkAllocateCommandBuffers(device, &cmdAllocInfo, &m_ofCommandBuffer) != VK_SUCCESS)
+		return false;
+
+	VkFenceCreateInfo fenceInfo{};
+	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+	if (vkCreateFence(device, &fenceInfo, nullptr, &m_ofExecFence) != VK_SUCCESS)
+		return false;
+
+	m_ofSessionValid = true;
+	cemuLog_log(LogType::Force, "VulkanTAAFilter: optical flow session created successfully ({}x{}), queue family {}", m_mvWidth, m_mvHeight, ofFamily);
+	return true;
 }
 
 void VulkanTAAFilter::TickPendingDeletes(VulkanRenderer* renderer)
@@ -669,6 +1220,8 @@ void VulkanTAAFilter::TickPendingDeletes(VulkanRenderer* renderer)
 			vkDestroyImage(device, it->image, nullptr);
 		if (it->memory != VK_NULL_HANDLE)
 			vkFreeMemory(device, it->memory, nullptr);
+		if (it->ofSession != VK_NULL_HANDLE)
+			vkDestroyOpticalFlowSessionNV(device, it->ofSession, nullptr);
 		it = m_pendingDeletes.erase(it);
 	}
 }
@@ -702,6 +1255,224 @@ bool VulkanTAAFilter::RecreateIfNeeded(VulkanRenderer* renderer, sint32 width, s
 	}
 	LatteTAA::InvalidateHistory();
 	return true;
+}
+
+// see the class-level design comment in VulkanTAAFilter.h ("cross-queue pipeline
+// state") for the full rationale. Returns true only on the (infrequent) frame
+// where a completed optical flow result was just converted into m_mvImage.
+bool VulkanTAAFilter::UpdateOpticalFlow(VulkanRenderer* renderer, VkCommandBuffer cmd, VkDevice device,
+										VkImageView scanoutViewRaw, float jitterUVx, float jitterUVy)
+{
+	m_ofColorRenderPass->flagForCurrentCommandBuffer();
+	for (uint32 i = 0; i < kOFColorSlots; i++)
+	{
+		m_ofColorFramebuffer[i]->flagForCurrentCommandBuffer();
+		m_ofColorViewObj[i]->flagForCurrentCommandBuffer();
+	}
+
+	bool producedResult = false;
+
+	// --- stage 1: fill any UNOCCUPIED slot with a fresh converted frame. A slot
+	// stays occupied from the moment it's written until stage 4 fully consumes it
+	// (see the occupancy comment in the header) - both slots of a round free up
+	// together, so this naturally writes 0, 1, or 2 slots per call depending on
+	// where we are in the round, never overwriting one still in use ---
+	for (uint32 slot = 0; slot < kOFColorSlots; slot++)
+	{
+		if (m_ofColorOccupied[slot])
+			continue;
+
+		_taaBarrierImage(cmd, m_ofColorImage[slot], m_ofColorLayout[slot], VK_IMAGE_LAYOUT_GENERAL,
+						 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+						 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+		m_ofColorLayout[slot] = VK_IMAGE_LAYOUT_GENERAL;
+
+		VkDescriptorSet ofInputDescSet = m_descriptorRing[m_descriptorRingIndex];
+		m_descriptorRingIndex = (m_descriptorRingIndex + 1) % kDescriptorRingSize;
+		// binding 1/2 unused by ofInputSrc, filled with the history view like the
+		// block-matching mv pass does for its own unused slots
+		VkDescriptorImageInfo ofInputImageInfos[kDescriptorBindings]{};
+		ofInputImageInfos[0] = { m_sampler->GetSampler(), scanoutViewRaw, VK_IMAGE_LAYOUT_GENERAL };
+		ofInputImageInfos[1] = { m_sampler->GetSampler(), m_viewObj[m_currentHistory]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+		ofInputImageInfos[2] = { m_sampler->GetSampler(), m_viewObj[m_currentHistory]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+		VkWriteDescriptorSet ofInputWrites[kDescriptorBindings]{};
+		for (uint32 i = 0; i < kDescriptorBindings; i++)
+		{
+			ofInputWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			ofInputWrites[i].dstSet = ofInputDescSet;
+			ofInputWrites[i].dstBinding = i;
+			ofInputWrites[i].descriptorCount = 1;
+			ofInputWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			ofInputWrites[i].pImageInfo = &ofInputImageInfos[i];
+		}
+		vkUpdateDescriptorSets(device, kDescriptorBindings, ofInputWrites, 0, nullptr);
+
+		VkRenderPassBeginInfo ofInputRpBegin{};
+		ofInputRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		ofInputRpBegin.renderPass = m_ofColorRenderPass->m_renderPass;
+		ofInputRpBegin.framebuffer = m_ofColorFramebuffer[slot]->m_frameBuffer;
+		ofInputRpBegin.renderArea.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight };
+		vkCmdBeginRenderPass(cmd, &ofInputRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineOFInput);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ofInputDescSet, 0, nullptr);
+		VkViewport ofInputViewport{ 0.0f, 0.0f, (float)m_mvWidth, (float)m_mvHeight, 0.0f, 1.0f };
+		vkCmdSetViewport(cmd, 0, 1, &ofInputViewport);
+		VkRect2D ofInputScissor{ {0, 0}, { (uint32)m_mvWidth, (uint32)m_mvHeight } };
+		vkCmdSetScissor(cmd, 0, 1, &ofInputScissor);
+		PushConstants ofInputPc{};
+		ofInputPc.jitterUVx = jitterUVx;
+		ofInputPc.jitterUVy = jitterUVy;
+		vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ofInputPc), &ofInputPc);
+		vkCmdDraw(cmd, 3, 1, 0, 0);
+		vkCmdEndRenderPass(cmd);
+
+		_taaBarrierImage(cmd, m_ofColorImage[slot], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+						 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+						 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+		// captured so stage 2 can confirm (via Cemu's own command-buffer-completion
+		// tracking) once this write is actually visible on the GPU - this is what
+		// lets the OF queue submission below be sequenced safely without a semaphore
+		m_ofColorCmdBufferId[slot] = renderer->GetCurrentCommandBufferId();
+		m_ofColorReady[slot] = false;
+		m_ofColorOccupied[slot] = true;
+		m_ofColorWriteSeq[slot] = m_ofNextWriteSeq++;
+	}
+
+	// --- stage 2: confirm any pending graphics-queue color writes are done ---
+	for (uint32 i = 0; i < kOFColorSlots; i++)
+	{
+		if (!m_ofColorReady[i] && m_ofColorOccupied[i] && renderer->HasCommandBufferFinished(m_ofColorCmdBufferId[i]))
+			m_ofColorReady[i] = true;
+	}
+
+	// --- stage 3: launch a new execute on the dedicated OF queue once it's free
+	// and both slots are confirmed ready. The slot with the higher write sequence
+	// is INPUT (newer/current), the other is REFERENCE (older/previous) ---
+	if (!m_ofExecInFlight && m_ofColorReady[0] && m_ofColorReady[1])
+	{
+		const uint32 inputSlot = (m_ofColorWriteSeq[0] > m_ofColorWriteSeq[1]) ? 0u : 1u;
+		const uint32 refSlot = 1 - inputSlot;
+		{
+			vkResetCommandBuffer(m_ofCommandBuffer, 0);
+			VkCommandBufferBeginInfo ofBeginInfo{};
+			ofBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+			ofBeginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+			vkBeginCommandBuffer(m_ofCommandBuffer, &ofBeginInfo);
+
+			// defensive barriers on the reading side too, even though the color
+			// writes are already host-confirmed complete (stage 2) before this
+			// submission is issued - cheap, and avoids relying purely on the
+			// "completed submission implies visibility to host-sequenced future
+			// work" guarantee being interpreted correctly for this vendor extension
+			_taaBarrierImage2(m_ofCommandBuffer, m_ofColorImage[inputSlot], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+							  VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_OPTICAL_FLOW_READ_BIT_NV,
+							  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV);
+			_taaBarrierImage2(m_ofCommandBuffer, m_ofColorImage[refSlot], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+							  VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_OPTICAL_FLOW_READ_BIT_NV,
+							  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV);
+			_taaBarrierImage2(m_ofCommandBuffer, m_ofFlowImage, m_ofFlowLayout, VK_IMAGE_LAYOUT_GENERAL,
+							  0, VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV,
+							  VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV);
+			m_ofFlowLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+			vkBindOpticalFlowSessionImageNV(device, m_ofSession, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_INPUT_NV, m_ofColorViewObj[inputSlot]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL);
+			vkBindOpticalFlowSessionImageNV(device, m_ofSession, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_REFERENCE_NV, m_ofColorViewObj[refSlot]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL);
+			vkBindOpticalFlowSessionImageNV(device, m_ofSession, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_FLOW_VECTOR_NV, m_ofFlowViewObj->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL);
+
+			VkOpticalFlowExecuteInfoNV ofExecInfo{};
+			ofExecInfo.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_EXECUTE_INFO_NV;
+			vkCmdOpticalFlowExecuteNV(m_ofCommandBuffer, m_ofSession, &ofExecInfo);
+
+			vkEndCommandBuffer(m_ofCommandBuffer);
+
+			VkSubmitInfo ofSubmit{};
+			ofSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+			ofSubmit.commandBufferCount = 1;
+			ofSubmit.pCommandBuffers = &m_ofCommandBuffer;
+			vkQueueSubmit(renderer->GetOpticalFlowQueue(), 1, &ofSubmit, m_ofExecFence);
+
+			// both slots stay occupied (see the header comment) through the entire
+			// exec-in-flight period, freed together only once stage 4 consumes them
+			m_ofExecInputSlot = inputSlot;
+			m_ofExecRefSlot = refSlot;
+			m_ofExecInFlight = true;
+		}
+	}
+
+	// --- stage 4: consume a completed execute's result, if any ---
+	if (m_ofExecInFlight && vkGetFenceStatus(device, m_ofExecFence) == VK_SUCCESS)
+	{
+		vkResetFences(device, 1, &m_ofExecFence);
+
+		m_mvRenderPass->flagForCurrentCommandBuffer();
+		m_mvFramebuffer->flagForCurrentCommandBuffer();
+		m_mvViewObj->flagForCurrentCommandBuffer();
+		m_ofFlowViewObj->flagForCurrentCommandBuffer();
+		m_ofFlowSampler->flagForCurrentCommandBuffer();
+
+		// convert flow vector -> m_mvImage (UV-space RG, same convention the
+		// block-matching output uses - resolve/DLAA read this unchanged either way)
+		_taaBarrierImage2(cmd, m_ofFlowImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+						  VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV, VK_ACCESS_2_SHADER_READ_BIT,
+						  VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+
+		VkDescriptorSet ofConvertDescSet = m_descriptorRing[m_descriptorRingIndex];
+		m_descriptorRingIndex = (m_descriptorRingIndex + 1) % kDescriptorRingSize;
+		VkDescriptorImageInfo ofConvertImageInfos[kDescriptorBindings]{};
+		ofConvertImageInfos[0] = { m_ofFlowSampler->GetSampler(), m_ofFlowViewObj->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+		ofConvertImageInfos[1] = { m_sampler->GetSampler(), m_viewObj[m_currentHistory]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+		ofConvertImageInfos[2] = { m_sampler->GetSampler(), m_viewObj[m_currentHistory]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+		VkWriteDescriptorSet ofConvertWrites[kDescriptorBindings]{};
+		for (uint32 i = 0; i < kDescriptorBindings; i++)
+		{
+			ofConvertWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			ofConvertWrites[i].dstSet = ofConvertDescSet;
+			ofConvertWrites[i].dstBinding = i;
+			ofConvertWrites[i].descriptorCount = 1;
+			ofConvertWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			ofConvertWrites[i].pImageInfo = &ofConvertImageInfos[i];
+		}
+		vkUpdateDescriptorSets(device, kDescriptorBindings, ofConvertWrites, 0, nullptr);
+
+		_taaBarrierImage(cmd, m_mvImage, m_mvLayout, VK_IMAGE_LAYOUT_GENERAL,
+						 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+						 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+		m_mvLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+		VkRenderPassBeginInfo ofConvertRpBegin{};
+		ofConvertRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		ofConvertRpBegin.renderPass = m_mvRenderPass->m_renderPass;
+		ofConvertRpBegin.framebuffer = m_mvFramebuffer->m_frameBuffer;
+		ofConvertRpBegin.renderArea.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight };
+		vkCmdBeginRenderPass(cmd, &ofConvertRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineOFConvert);
+		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &ofConvertDescSet, 0, nullptr);
+		VkViewport ofConvertViewport{ 0.0f, 0.0f, (float)m_mvWidth, (float)m_mvHeight, 0.0f, 1.0f };
+		vkCmdSetViewport(cmd, 0, 1, &ofConvertViewport);
+		VkRect2D ofConvertScissor{ {0, 0}, { (uint32)m_mvWidth, (uint32)m_mvHeight } };
+		vkCmdSetScissor(cmd, 0, 1, &ofConvertScissor);
+		PushConstants ofConvertPc{};
+		ofConvertPc.ofFlowScaleX = 1.0f / (float)m_mvWidth;
+		ofConvertPc.ofFlowScaleY = 1.0f / (float)m_mvHeight;
+		vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ofConvertPc), &ofConvertPc);
+		vkCmdDraw(cmd, 3, 1, 0, 0);
+		vkCmdEndRenderPass(cmd);
+
+		_taaBarrierImage(cmd, m_mvImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+						 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+						 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+		// free both color slots this execute consumed - stage 1 refills them next call
+		m_ofColorOccupied[m_ofExecInputSlot] = false;
+		m_ofColorOccupied[m_ofExecRefSlot] = false;
+		m_ofExecInFlight = false;
+		producedResult = true;
+		if (!m_ofHasEverProducedResult)
+			cemuLog_log(LogType::Force, "VulkanTAAFilter: optical flow pipeline produced its first real result (cross-queue round trip confirmed working end-to-end)");
+	}
+
+	return producedResult;
 }
 
 void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanoutView)
@@ -776,6 +1547,8 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	m_viewObj[srcIdx]->flagForCurrentCommandBuffer();
 	m_viewObj[dstIdx]->flagForCurrentCommandBuffer();
 	m_sampler->flagForCurrentCommandBuffer();
+	if (m_ofFlowSampler)
+		m_ofFlowSampler->flagForCurrentCommandBuffer();
 
 	// Cemu's generic render pass and layout tracking operate in VK_IMAGE_LAYOUT_GENERAL
 	// (see VKRObjectRenderPass: initial/final layout = GENERAL). Keep every image in
@@ -810,70 +1583,94 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	const float jitterUVx = jitterPxX / (float)m_width;
 	const float jitterUVy = jitterPxY / (float)m_height;
 
-	// motion vector search pass: only in temporal mode (FXAA has no history to
+	// motion vector source: only in temporal mode (FXAA has no history to
 	// reproject). Always runs when temporal, regardless of the useMotionVectors
 	// toggle - that toggle only gates whether the resolve below ACTS on the
 	// result, so A/B testing never has to pay for a different barrier/descriptor
-	// path and the MV texture is never read while genuinely uninitialized
+	// path and the MV texture is never read while genuinely uninitialized.
+	// Two possible sources write into the same m_mvImage (UV-space RG offset):
+	// hardware optical flow (VK_NV_optical_flow, real motion estimation, see
+	// LatteTAA::Config::useOpticalFlow) when available+enabled, else the
+	// block-matching search below. Downstream (this filter's resolve, DLAA) never
+	// needs to know which one ran.
 	if (!config.useFxaa)
 	{
-		m_mvRenderPass->flagForCurrentCommandBuffer();
-		m_mvFramebuffer->flagForCurrentCommandBuffer();
-		m_mvViewObj->flagForCurrentCommandBuffer();
+		if (config.useOpticalFlow && renderer->IsOpticalFlowAvailable() && !m_ofSessionValid && !m_ofUnsupported)
+			CreateOpticalFlowSession(renderer); // best-effort; falls through to block-matching on failure
 
-		// about to be fully overwritten as an attachment (same idiom as the
-		// history "dst" barrier above): no need to preserve prior contents
-		_taaBarrierImage(cmd, m_mvImage, m_mvLayout, VK_IMAGE_LAYOUT_GENERAL,
-						 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-						 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-		m_mvLayout = VK_IMAGE_LAYOUT_GENERAL;
+		bool ofProducedFreshResult = false;
+		if (config.useOpticalFlow && m_ofSessionValid)
+			ofProducedFreshResult = UpdateOpticalFlow(renderer, cmd, device, scanoutViewRaw, jitterUVx, jitterUVy);
+		if (ofProducedFreshResult)
+			m_ofHasEverProducedResult = true;
 
-		VkDescriptorSet mvDescSet = m_descriptorRing[m_descriptorRingIndex];
-		m_descriptorRingIndex = (m_descriptorRingIndex + 1) % kDescriptorRingSize;
-		// binding 2 (motion vectors) is unused by this shader but still needs a
-		// valid image bound to satisfy the shared layout - reuse the history view
-		VkDescriptorImageInfo mvImageInfos[kDescriptorBindings]{};
-		mvImageInfos[0] = { m_sampler->GetSampler(), scanoutViewRaw, VK_IMAGE_LAYOUT_GENERAL };
-		mvImageInfos[1] = { m_sampler->GetSampler(), m_viewObj[srcIdx]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
-		mvImageInfos[2] = { m_sampler->GetSampler(), m_viewObj[srcIdx]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
-		VkWriteDescriptorSet mvWrites[kDescriptorBindings]{};
-		for (uint32 i = 0; i < kDescriptorBindings; i++)
+		// run the block-matching search whenever optical flow isn't driving
+		// m_mvImage exclusively yet: either it's off/unavailable, or it's still
+		// warming up (hasn't produced its first pipelined result). Once optical
+		// flow has produced at least one result, this stops - m_mvImage holds
+		// whatever optical flow last produced until its next pipelined update,
+		// rather than mixing two different motion estimators frame to frame.
+		if (!config.useOpticalFlow || !m_ofSessionValid || !m_ofHasEverProducedResult)
 		{
-			mvWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-			mvWrites[i].dstSet = mvDescSet;
-			mvWrites[i].dstBinding = i;
-			mvWrites[i].descriptorCount = 1;
-			mvWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-			mvWrites[i].pImageInfo = &mvImageInfos[i];
+			// === block-matching search path (default / fallback, or warm-up) ===
+			m_mvRenderPass->flagForCurrentCommandBuffer();
+			m_mvFramebuffer->flagForCurrentCommandBuffer();
+			m_mvViewObj->flagForCurrentCommandBuffer();
+
+			// about to be fully overwritten as an attachment (same idiom as the
+			// history "dst" barrier above): no need to preserve prior contents
+			_taaBarrierImage(cmd, m_mvImage, m_mvLayout, VK_IMAGE_LAYOUT_GENERAL,
+							 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+							 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+			m_mvLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+			VkDescriptorSet mvDescSet = m_descriptorRing[m_descriptorRingIndex];
+			m_descriptorRingIndex = (m_descriptorRingIndex + 1) % kDescriptorRingSize;
+			// binding 2 (motion vectors) is unused by this shader but still needs a
+			// valid image bound to satisfy the shared layout - reuse the history view
+			VkDescriptorImageInfo mvImageInfos[kDescriptorBindings]{};
+			mvImageInfos[0] = { m_sampler->GetSampler(), scanoutViewRaw, VK_IMAGE_LAYOUT_GENERAL };
+			mvImageInfos[1] = { m_sampler->GetSampler(), m_viewObj[srcIdx]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+			mvImageInfos[2] = { m_sampler->GetSampler(), m_viewObj[srcIdx]->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL };
+			VkWriteDescriptorSet mvWrites[kDescriptorBindings]{};
+			for (uint32 i = 0; i < kDescriptorBindings; i++)
+			{
+				mvWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+				mvWrites[i].dstSet = mvDescSet;
+				mvWrites[i].dstBinding = i;
+				mvWrites[i].descriptorCount = 1;
+				mvWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+				mvWrites[i].pImageInfo = &mvImageInfos[i];
+			}
+			vkUpdateDescriptorSets(device, kDescriptorBindings, mvWrites, 0, nullptr);
+
+			VkRenderPassBeginInfo mvRpBegin{};
+			mvRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			mvRpBegin.renderPass = m_mvRenderPass->m_renderPass;
+			mvRpBegin.framebuffer = m_mvFramebuffer->m_frameBuffer;
+			mvRpBegin.renderArea.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight };
+			vkCmdBeginRenderPass(cmd, &mvRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineMV);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &mvDescSet, 0, nullptr);
+
+			VkViewport mvViewport{ 0.0f, 0.0f, (float)m_mvWidth, (float)m_mvHeight, 0.0f, 1.0f };
+			vkCmdSetViewport(cmd, 0, 1, &mvViewport);
+			VkRect2D mvScissor{ {0, 0}, { (uint32)m_mvWidth, (uint32)m_mvHeight } };
+			vkCmdSetScissor(cmd, 0, 1, &mvScissor);
+
+			PushConstants mvPc{};
+			mvPc.jitterUVx = jitterUVx;
+			mvPc.jitterUVy = jitterUVy;
+			mvPc.mvSearchStep = config.mvSearchStep;
+			mvPc.mvRegularization = config.mvRegularization;
+			vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mvPc), &mvPc);
+			vkCmdDraw(cmd, 3, 1, 0, 0);
+			vkCmdEndRenderPass(cmd);
+
+			_taaBarrierImage(cmd, m_mvImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+							 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+							 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 		}
-		vkUpdateDescriptorSets(device, kDescriptorBindings, mvWrites, 0, nullptr);
-
-		VkRenderPassBeginInfo mvRpBegin{};
-		mvRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-		mvRpBegin.renderPass = m_mvRenderPass->m_renderPass;
-		mvRpBegin.framebuffer = m_mvFramebuffer->m_frameBuffer;
-		mvRpBegin.renderArea.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight };
-		vkCmdBeginRenderPass(cmd, &mvRpBegin, VK_SUBPASS_CONTENTS_INLINE);
-		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineMV);
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &mvDescSet, 0, nullptr);
-
-		VkViewport mvViewport{ 0.0f, 0.0f, (float)m_mvWidth, (float)m_mvHeight, 0.0f, 1.0f };
-		vkCmdSetViewport(cmd, 0, 1, &mvViewport);
-		VkRect2D mvScissor{ {0, 0}, { (uint32)m_mvWidth, (uint32)m_mvHeight } };
-		vkCmdSetScissor(cmd, 0, 1, &mvScissor);
-
-		PushConstants mvPc{};
-		mvPc.jitterUVx = jitterUVx;
-		mvPc.jitterUVy = jitterUVy;
-		mvPc.mvSearchStep = config.mvSearchStep;
-		mvPc.mvRegularization = config.mvRegularization;
-		vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mvPc), &mvPc);
-		vkCmdDraw(cmd, 3, 1, 0, 0);
-		vkCmdEndRenderPass(cmd);
-
-		_taaBarrierImage(cmd, m_mvImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-						 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-						 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 	}
 
 	// update the next descriptor set in the ring
@@ -1113,6 +1910,11 @@ void VulkanTAAFilter::Shutdown(VulkanRenderer* renderer)
 	{
 		m_sampler->decRef();
 		m_sampler = nullptr;
+	}
+	if (m_ofFlowSampler)
+	{
+		m_ofFlowSampler->decRef();
+		m_ofFlowSampler = nullptr;
 	}
 }
 

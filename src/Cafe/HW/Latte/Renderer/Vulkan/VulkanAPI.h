@@ -241,6 +241,13 @@ VKFUNC_DEVICE(vkCreateDescriptorPool);
 VKFUNC_DEVICE(vkDestroyDescriptorPool);
 VKFUNC_DEVICE(vkDestroyDescriptorSetLayout);
 
+// optical flow (hardware motion estimation, see VulkanTAAFilter)
+VKFUNC_INSTANCE(vkGetPhysicalDeviceOpticalFlowImageFormatsNV);
+VKFUNC_DEVICE(vkCreateOpticalFlowSessionNV);
+VKFUNC_DEVICE(vkDestroyOpticalFlowSessionNV);
+VKFUNC_DEVICE(vkBindOpticalFlowSessionImageNV);
+VKFUNC_DEVICE(vkCmdOpticalFlowExecuteNV);
+
 #undef VKFUNC_INIT
 #undef VKFUNC_INSTANCE_INIT
 #undef VKFUNC_DEVICE_INIT

@@ -230,6 +230,19 @@ public:
 	void DLAA_Apply(LatteTextureView* textureView);
 	VkCommandBuffer DLAA_GetCommandBuffer();
 
+	// hardware motion estimation (VK_NV_optical_flow, see VulkanTAAFilter) - also
+	// needs synchronization2 (vkCmdPipelineBarrier2KHR), required to issue the
+	// VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV / VK_ACCESS_2_OPTICAL_FLOW_*_BIT_NV
+	// barriers this extension's spec calls for around the execute call - the
+	// legacy barrier API has no equivalent flags for this vendor extension
+	bool IsOpticalFlowAvailable() const { return m_featureControl.deviceExtensions.optical_flow_hw && m_featureControl.deviceExtensions.synchronization2 && m_opticalFlowQueueFamily >= 0; }
+	bool IsSynchronization2Available() const { return m_featureControl.deviceExtensions.synchronization2; }
+	int32_t GetGraphicsQueueFamilyIndex() const { return m_indices.graphicsFamily; }
+	// dedicated queue for VK_NV_optical_flow (see VulkanTAAFilter) - -1/VK_NULL_HANDLE
+	// if this system/driver has no queue family reporting VK_QUEUE_OPTICAL_FLOW_BIT_NV
+	int32_t GetOpticalFlowQueueFamilyIndex() const { return m_opticalFlowQueueFamily; }
+	VkQueue GetOpticalFlowQueue() const { return m_opticalFlowQueue; }
+
 	VkDescriptorPool GetDescriptorPool() const { return m_descriptorPool; }
 
 	void WaitDeviceIdle() const { vkDeviceWaitIdle(m_logicalDevice); }
@@ -469,6 +482,8 @@ private:
 			bool dynamic_rendering = false; // VK_KHR_dynamic_rendering
 			bool shader_float_controls = false; // VK_KHR_shader_float_controls
 			bool present_wait = false; // VK_KHR_present_wait
+			bool optical_flow = false; // VK_NV_optical_flow (extension present)
+			bool optical_flow_hw = false; // extension present AND VkPhysicalDeviceOpticalFlowFeaturesNV::opticalFlow confirmed true
 		}deviceExtensions;
 
 		struct
@@ -510,6 +525,12 @@ private:
 	VkDescriptorSetLayout m_swapchainDescriptorSetLayout;
 
 	VkQueue m_graphicsQueue, m_presentQueue;
+
+	// dedicated queue for VK_NV_optical_flow (see VulkanTAAFilter) - narrow queue on
+	// NVIDIA hardware (transfer + optical flow only, no graphics/compute), separate
+	// from m_graphicsQueue. -1/VK_NULL_HANDLE if no such family exists on this system.
+	int32_t m_opticalFlowQueueFamily{ -1 };
+	VkQueue m_opticalFlowQueue{ VK_NULL_HANDLE };
 
 	// swapchain
 

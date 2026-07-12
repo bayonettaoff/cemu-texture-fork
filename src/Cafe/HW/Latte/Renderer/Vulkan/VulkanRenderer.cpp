@@ -278,6 +278,14 @@ void VulkanRenderer::GetDeviceFeatures()
 	pwf.pNext = prevStruct;
 	prevStruct = &pwf;
 
+	VkPhysicalDeviceOpticalFlowFeaturesNV opticalFlowFeature{};
+	if (m_featureControl.deviceExtensions.optical_flow)
+	{
+		opticalFlowFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
+		opticalFlowFeature.pNext = prevStruct;
+		prevStruct = &opticalFlowFeature;
+	}
+
 	VkPhysicalDeviceFeatures2 physicalDeviceFeatures2{};
 	physicalDeviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
 	physicalDeviceFeatures2.pNext = prevStruct;
@@ -306,6 +314,8 @@ void VulkanRenderer::GetDeviceFeatures()
 
 	m_featureControl.deviceExtensions.pipeline_creation_cache_control = pcc.pipelineCreationCacheControl;
 	m_featureControl.deviceExtensions.custom_border_color_without_format = m_featureControl.deviceExtensions.custom_border_color && bcf.customBorderColorWithoutFormat;
+	m_featureControl.deviceExtensions.optical_flow_hw = m_featureControl.deviceExtensions.optical_flow && opticalFlowFeature.opticalFlow;
+	cemuLog_log(LogType::Force, "Vulkan: VK_NV_optical_flow: {}", m_featureControl.deviceExtensions.optical_flow_hw ? "supported" : "unsupported");
 	m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32 = m_featureControl.deviceExtensions.shader_float_controls && pfcp.shaderRoundingModeRTEFloat32;
 	if(!m_featureControl.shaderFloatControls.shaderRoundingModeRTEFloat32)
 		cemuLog_log(LogType::Force, "Shader round mode control not available on this device or driver. Some rendering issues might occur.");
@@ -341,7 +351,10 @@ VulkanRenderer::VulkanRenderer()
 
 	cemuLog_log(LogType::Force, "------- Init Vulkan graphics backend -------");
 
-	const bool useValidationLayer = cemuLog_isLoggingEnabled(LogType::VulkanValidation);
+	// CEMU_VK_VALIDATION: env var escape hatch to force the validation layer on
+	// without going through the Debug logging menu - useful for diagnosing a crash
+	// from a launch script/session where clicking through the UI isn't practical
+	const bool useValidationLayer = cemuLog_isLoggingEnabled(LogType::VulkanValidation) || std::getenv("CEMU_VK_VALIDATION") != nullptr;
 	if (useValidationLayer)
 		cemuLog_log(LogType::Force, "Validation layer is enabled");
 
@@ -474,6 +487,30 @@ VulkanRenderer::VulkanRenderer()
 	// create logical device
 	m_indices = FindQueueFamilies(surface, m_physicalDevice);
 	std::set<int> uniqueQueueFamilies = { m_indices.graphicsFamily, m_indices.presentFamily };
+
+	// hardware optical flow (VK_NV_optical_flow, see VulkanTAAFilter) needs a queue
+	// from a family that reports VK_QUEUE_OPTICAL_FLOW_BIT_NV - on NVIDIA hardware
+	// this is typically a separate, narrow queue (transfer + optical flow only, no
+	// graphics/compute), distinct from the graphics family used everywhere else in
+	// this renderer. Request it here (if present) so it's available if a session is
+	// ever created later - queues can't be added to an already-created device.
+	if (m_featureControl.deviceExtensions.optical_flow_hw)
+	{
+		uint32 queueFamilyCount = 0;
+		vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, nullptr);
+		std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &queueFamilyCount, queueFamilies.data());
+		for (uint32 i = 0; i < queueFamilyCount; i++)
+		{
+			if (queueFamilies[i].queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV)
+			{
+				m_opticalFlowQueueFamily = (int32_t)i;
+				uniqueQueueFamilies.insert((int)i);
+				break;
+			}
+		}
+	}
+
 	std::vector<VkDeviceQueueCreateInfo> queueCreateInfos = CreateQueueCreateInfos(uniqueQueueFamilies);
 	VkPhysicalDeviceFeatures deviceFeatures = {};
 
@@ -536,6 +573,27 @@ VulkanRenderer::VulkanRenderer()
 		deviceExtensionFeatures = &presentWaitFeature;
 		presentWaitFeature.presentWait = VK_TRUE;
 	}
+	// enable VK_NV_optical_flow (see VulkanTAAFilter - hardware motion estimation)
+	VkPhysicalDeviceOpticalFlowFeaturesNV opticalFlowEnableFeature{};
+	if (m_featureControl.deviceExtensions.optical_flow_hw)
+	{
+		opticalFlowEnableFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
+		opticalFlowEnableFeature.pNext = deviceExtensionFeatures;
+		deviceExtensionFeatures = &opticalFlowEnableFeature;
+		opticalFlowEnableFeature.opticalFlow = VK_TRUE;
+	}
+	// enable VK_KHR_synchronization2's feature bit - the extension being present
+	// isn't enough, vkCmdPipelineBarrier2KHR itself validates this feature was
+	// explicitly requested (VUID-vkCmdPipelineBarrier2-synchronization2-03848).
+	// Needed for the vendor-specific optical flow barriers in VulkanTAAFilter.
+	VkPhysicalDeviceSynchronization2FeaturesKHR sync2EnableFeature{};
+	if (m_featureControl.deviceExtensions.synchronization2)
+	{
+		sync2EnableFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
+		sync2EnableFeature.pNext = deviceExtensionFeatures;
+		deviceExtensionFeatures = &sync2EnableFeature;
+		sync2EnableFeature.synchronization2 = VK_TRUE;
+	}
 
 	std::vector<const char*> used_extensions;
 	VkDeviceCreateInfo createInfo = CreateDeviceCreateInfo(queueCreateInfos, deviceFeatures, deviceExtensionFeatures, used_extensions);
@@ -551,6 +609,12 @@ VulkanRenderer::VulkanRenderer()
 
 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_graphicsQueue);
 	vkGetDeviceQueue(m_logicalDevice, m_indices.graphicsFamily, 0, &m_presentQueue);
+
+	if (m_opticalFlowQueueFamily >= 0)
+	{
+		vkGetDeviceQueue(m_logicalDevice, (uint32)m_opticalFlowQueueFamily, 0, &m_opticalFlowQueue);
+		cemuLog_log(LogType::Force, "Vulkan: acquired dedicated optical flow queue (family {})", m_opticalFlowQueueFamily);
+	}
 
 #if BOOST_OS_WINDOWS
 	InitNGX();
@@ -1186,6 +1250,8 @@ VkDeviceCreateInfo VulkanRenderer::CreateDeviceCreateInfo(const std::vector<VkDe
 		used_extensions.emplace_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
 	if (m_featureControl.deviceExtensions.present_wait)
 		used_extensions.emplace_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+	if (m_featureControl.deviceExtensions.optical_flow_hw)
+		used_extensions.emplace_back(VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
 #if BOOST_OS_WINDOWS
 	// DLAA (see LatteDLSS.h) - already filtered down to what this device supports
 	for (const auto& ext : m_featureControl.ngxDeviceExtensions)
@@ -1352,6 +1418,9 @@ bool VulkanRenderer::CheckDeviceExtensionSupport(const VkPhysicalDevice device, 
 	info.deviceExtensions.dynamic_rendering = false; // isExtensionAvailable(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 	// dynamic rendering doesn't provide any benefits for us right now. Driver implementations are very unoptimized as of Feb 2022
 	info.deviceExtensions.present_wait = isExtensionAvailable(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) && isExtensionAvailable(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+	// real hardware-accelerated motion estimation (RTX Ampere+, see VulkanTAAFilter) -
+	// generic, works on any game's already-rendered frames, no per-game assumptions
+	info.deviceExtensions.optical_flow = isExtensionAvailable(VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
 
 #if BOOST_OS_WINDOWS
 	// DLAA (see LatteDLSS.h) - only keep the ones this specific device actually exposes;
