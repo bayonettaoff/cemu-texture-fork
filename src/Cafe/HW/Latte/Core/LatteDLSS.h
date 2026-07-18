@@ -18,6 +18,12 @@ namespace LatteDLSS
 
 	Config& GetConfig();
 
+	// extra negative texture LOD bias to stack on top of the game's own per-texture
+	// bias while DLAA is actually running (0.0f otherwise) - see LatteDLSS.cpp for
+	// the derivation. Read from VulkanRenderer::draw_getOrCreateDescriptorSet's
+	// sampler setup, same call site as the existing graphic-pack LOD bias overrides.
+	float GetMipmapBias();
+
 	// dispatched from LatteTexture_Delete / LatteMRT::SetDepthAndStencilAttachment,
 	// same pattern as LatteSSAO - see VulkanDLSSFilter's NotifyTextureDeletion/NotifyDepthBind
 	void NotifyTextureDeletion(LatteTexture* texture);

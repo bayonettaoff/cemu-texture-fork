@@ -4,6 +4,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanPipelineStableCache.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
+#include "Cafe/HW/Latte/Core/LatteGeometryAmp.h"
 #include "Cafe/OS/libs/gx2/GX2.h"
 #include "config/ActiveSettings.h"
 #include "util/helpers/Serializer.h"
@@ -155,6 +156,188 @@ RendererShaderVk* rectsEmulationGS_generate(LatteDecompilerShader* vertexShader,
 	// p1 to p2 is diagonal
 	rectsEmulationGS_outputVerticesCode(gsSrc, vertexShader, psInputTable, 0, 1, 2, 3, "C", latteRegister);
 	gsSrc.append("}\r\n");
+
+	gsSrc.append("}\r\n");
+
+	auto vkShader = new RendererShaderVk(RendererShader::ShaderType::kGeometry, 0, 0, false, false, gsSrc);
+	vkShader->PreponeCompilation(true);
+	return vkShader;
+}
+
+/* geometry amplification */
+// See Core/LatteGeometryAmp.h for the design rationale. Subdivides each input
+// triangle 1->4 via edge midpoints, displacing the 3 new midpoints along a
+// Phong-tessellation-style projection to round low-poly silhouettes exposed
+// by 4K texture replacement (confirmed on Bayonetta 2's arms - real geometry
+// limit, not a shading bug). Original corner vertices are passed through
+// unmodified so amplified draws still seam correctly against anything
+// unamplified sharing those vertices.
+
+// emits the passthrough-varying declarations shared by rects and amplification
+// (both iterate the same VS-output/PS-input intersection). Returns the list
+// of semantic IDs actually declared, so the caller knows what it can use as
+// normal-detection candidates.
+static std::vector<sint32> geometryAmp_emitVaryingDecls(std::string& gsSrc, LatteDecompilerShader* vertexShader, LatteShaderPSInputTable* psInputTable, const LatteContextRegister& latteRegister)
+{
+	std::vector<sint32> semIds;
+	auto parameterMask = vertexShader->outputParameterMask;
+	for (sint32 f = 0; f < 2; f++)
+	{
+		for (uint32 i = 0; i < 32; i++)
+		{
+			if ((parameterMask & (1 << i)) == 0)
+				continue;
+			sint32 vsSemanticId = psInputTable->getVertexShaderOutParamSemanticId(latteRegister.GetRawView(), i);
+			if (vsSemanticId < 0)
+				continue;
+			auto psImport = psInputTable->getPSImportBySemanticId(vsSemanticId);
+			if (psImport == nullptr)
+				continue;
+
+			if (f == 0)
+				semIds.emplace_back(vsSemanticId);
+
+			gsSrc.append(fmt::format("layout(location = {}) ", psInputTable->getPSImportLocationBySemanticId(vsSemanticId)));
+			if (psImport->isFlat)
+				gsSrc.append("flat ");
+			if (psImport->isNoPerspective)
+				gsSrc.append("noperspective ");
+			if (f == 0)
+				gsSrc.append(fmt::format("in vec4 passParameterSem{}In[];\r\n", vsSemanticId));
+			else
+				gsSrc.append(fmt::format("out vec4 passParameterSem{}Out;\r\n", vsSemanticId));
+		}
+	}
+	return semIds;
+}
+
+// emits one output vertex: gl_Position = pos, and each passthrough varying
+// either copied straight from corner index `srcA` (srcB < 0) or lerped
+// between corners srcA/srcB (edge midpoint - same weights as `pos` itself,
+// which the caller already computed the same way, satisfying the brief's
+// "UV interpolation with same barycentric weights as position" requirement)
+static void geometryAmp_emitVertex(std::string& gsSrc, const std::vector<sint32>& semIds, const char* posExpr, sint32 srcA, sint32 srcB)
+{
+	for (sint32 semId : semIds)
+	{
+		if (srcB < 0)
+			gsSrc.append(fmt::format("passParameterSem{}Out = passParameterSem{}In[{}];\r\n", semId, semId, srcA));
+		else
+			gsSrc.append(fmt::format("passParameterSem{}Out = (passParameterSem{}In[{}] + passParameterSem{}In[{}]) * 0.5;\r\n", semId, semId, srcA, semId, srcB));
+	}
+	gsSrc.append(fmt::format("gl_Position = {};\r\n", posExpr));
+	gsSrc.append("EmitVertex();\r\n");
+}
+
+RendererShaderVk* geometryAmp_generate(LatteDecompilerShader* vertexShader, const LatteContextRegister& latteRegister)
+{
+	const auto& config = LatteGeometryAmp::GetConfig();
+
+	std::string gsSrc;
+	gsSrc.append("#version 450\r\n");
+	gsSrc.append("layout(triangles) in;\r\n");
+	gsSrc.append("layout(triangle_strip, max_vertices = 12) out;\r\n");
+
+	LatteShaderPSInputTable* psInputTable = LatteSHRC_GetPSInputTable();
+	std::vector<sint32> semIds = geometryAmp_emitVaryingDecls(gsSrc, vertexShader, psInputTable, latteRegister);
+
+	gsSrc.append(fmt::format("const float kFactor = {:.6f};\r\n", config.factor));
+	gsSrc.append(fmt::format("const float kTolerance = {:.6f};\r\n", config.normalDetectTolerance));
+
+	// Phong-tessellation-style edge midpoint (Boubekeur & Alexa 2008). Divides
+	// by w first so the projection happens in an approximately metric space
+	// instead of raw (perspective-distorted) clip space, then re-homogenizes
+	// back to a valid clip-space position for the rasterizer. Purely local to
+	// the 2 edge endpoints (position + normal) -> two triangles sharing this
+	// edge compute the identical midpoint independently, so there are no
+	// cracks (same principle as PN-triangles/Phong tessellation in general,
+	// simplified because a fixed midpoint subdivision only ever needs the
+	// symmetric t=0.5 case).
+	gsSrc.append(
+	    // 2026-07-14: BUG FOUND (root cause of catastrophic map/environment
+	    // corruption seen with kFactor==0, i.e. even with displacement fully
+	    // disabled): this used to divide by w and re-homogenize UNCONDITIONALLY
+	    // to compute the midpoint. That divide-then-multiply round trip is only
+	    // equal to the correct clip-space linear midpoint (Pa+Pb)*0.5 when
+	    // wa==wb - for two vertices at similar depth (small character-mesh
+	    // triangles, e.g. Bayonetta's arm) the error is invisible, but for a
+	    // large environment surface where a single triangle spans a big depth
+	    // range (wa and wb far apart), the pre-divide/post-multiply result
+	    // lands nowhere near the real edge - exactly the giant misplaced-shard
+	    // corruption seen in-game, and exactly why it hit the map but not the
+	    // character. Fix: always compute the CORRECT clip-space linear
+	    // midpoint first, and only fall into the perspective-divided
+	    // projection math to compute a small ADDITIVE displacement delta when
+	    // actually displacing (hasNormal && kFactor>0) - never as a
+	    // replacement for the base position\r\n"
+	    "vec4 gaPhongMid(vec4 Pa, vec4 Pb, vec3 Na, vec3 Nb, bool hasNormal)\r\n"
+	    "{\r\n"
+	    "    vec4 flatMid = (Pa + Pb) * 0.5;\r\n"
+	    "    if (!hasNormal || kFactor <= 0.0) return flatMid;\r\n"
+	    "    float wa = abs(Pa.w) < 1e-6 ? 1e-6 : Pa.w;\r\n"
+	    "    float wb = abs(Pb.w) < 1e-6 ? 1e-6 : Pb.w;\r\n"
+	    "    vec3 pa = Pa.xyz / wa;\r\n"
+	    "    vec3 pb = Pb.xyz / wb;\r\n"
+	    "    vec3 lin = (pa + pb) * 0.5;\r\n"
+	    "    vec3 projA = lin - dot(lin - pa, Na) * Na;\r\n"
+	    "    vec3 projB = lin - dot(lin - pb, Nb) * Nb;\r\n"
+	    "    vec3 phong = (projA + projB) * 0.5;\r\n"
+	    "    vec3 deltaNDC = (phong - lin) * kFactor;\r\n"
+	    "    float wMid = flatMid.w;\r\n"
+	    "    return vec4(flatMid.xyz + deltaNDC * wMid, wMid);\r\n"
+	    "}\r\n");
+
+	gsSrc.append("void main()\r\n{\r\n");
+	gsSrc.append("vec4 P0 = gl_in[0].gl_Position;\r\n");
+	gsSrc.append("vec4 P1 = gl_in[1].gl_Position;\r\n");
+	gsSrc.append("vec4 P2 = gl_in[2].gl_Position;\r\n");
+
+	// normal auto-detect: try every passthrough varying as a candidate
+	// direction, keep whichever reads closest to unit length across the
+	// triangle's 3 corners (see LatteGeometryAmp.h - no per-game knowledge of
+	// which semantic is "the normal" is required or assumed).
+	gsSrc.append("vec3 n0 = vec3(0.0), n1 = vec3(0.0), n2 = vec3(0.0);\r\n");
+	gsSrc.append("float bestScore = kTolerance;\r\n");
+	gsSrc.append("bool hasNormal = false;\r\n");
+	gsSrc.append("{\r\n float avgLen, score;\r\n");
+	for (sint32 semId : semIds)
+	{
+		gsSrc.append(fmt::format(
+		    "avgLen = (length(passParameterSem{0}In[0].xyz) + length(passParameterSem{0}In[1].xyz) + length(passParameterSem{0}In[2].xyz)) / 3.0;\r\n"
+		    "score = abs(avgLen - 1.0);\r\n"
+		    "if (score < bestScore) {{ bestScore = score; hasNormal = true; n0 = passParameterSem{0}In[0].xyz; n1 = passParameterSem{0}In[1].xyz; n2 = passParameterSem{0}In[2].xyz; }}\r\n",
+		    semId));
+	}
+	gsSrc.append("}\r\n");
+	gsSrc.append("if (hasNormal) { n0 = normalize(n0); n1 = normalize(n1); n2 = normalize(n2); }\r\n");
+
+	gsSrc.append("vec4 M01 = gaPhongMid(P0, P1, n0, n1, hasNormal);\r\n");
+	gsSrc.append("vec4 M12 = gaPhongMid(P1, P2, n1, n2, hasNormal);\r\n");
+	gsSrc.append("vec4 M20 = gaPhongMid(P2, P0, n2, n0, hasNormal);\r\n");
+
+	// 4 sub-triangles from the classic single-step triangular quadrisection
+	// (0,M01,M20) (M01,1,M12) (M20,M12,2) (M01,M12,M20) - each keeps the
+	// original triangle's winding order, so front/back-face culling is
+	// unaffected.
+	geometryAmp_emitVertex(gsSrc, semIds, "P0",  0, -1);
+	geometryAmp_emitVertex(gsSrc, semIds, "M01", 0, 1);
+	geometryAmp_emitVertex(gsSrc, semIds, "M20", 2, 0);
+	gsSrc.append("EndPrimitive();\r\n");
+
+	geometryAmp_emitVertex(gsSrc, semIds, "M01", 0, 1);
+	geometryAmp_emitVertex(gsSrc, semIds, "P1",  1, -1);
+	geometryAmp_emitVertex(gsSrc, semIds, "M12", 1, 2);
+	gsSrc.append("EndPrimitive();\r\n");
+
+	geometryAmp_emitVertex(gsSrc, semIds, "M20", 2, 0);
+	geometryAmp_emitVertex(gsSrc, semIds, "M12", 1, 2);
+	geometryAmp_emitVertex(gsSrc, semIds, "P2",  2, -1);
+	gsSrc.append("EndPrimitive();\r\n");
+
+	geometryAmp_emitVertex(gsSrc, semIds, "M01", 0, 1);
+	geometryAmp_emitVertex(gsSrc, semIds, "M12", 1, 2);
+	geometryAmp_emitVertex(gsSrc, semIds, "M20", 2, 0);
+	gsSrc.append("EndPrimitive();\r\n");
 
 	gsSrc.append("}\r\n");
 
@@ -409,6 +592,8 @@ bool PipelineCompiler::InitShaderStages(VulkanRenderer* vkRenderer, RendererShad
 		shaderStages.emplace_back(vkRenderer->CreatePipelineShaderStageCreateInfo(VK_SHADER_STAGE_GEOMETRY_BIT, vkGeometryShader->GetShaderModule(), "main"));
 	else if (m_rectEmulationGS)
 		shaderStages.emplace_back(vkRenderer->CreatePipelineShaderStageCreateInfo(VK_SHADER_STAGE_GEOMETRY_BIT, m_rectEmulationGS->GetShaderModule(), "main"));
+	else if (m_geometryAmpGS)
+		shaderStages.emplace_back(vkRenderer->CreatePipelineShaderStageCreateInfo(VK_SHADER_STAGE_GEOMETRY_BIT, m_geometryAmpGS->GetShaderModule(), "main"));
 
 	if (vkPixelShader)
 		shaderStages.emplace_back(vkRenderer->CreatePipelineShaderStageCreateInfo(VK_SHADER_STAGE_FRAGMENT_BIT, vkPixelShader->GetShaderModule(), "main"));
@@ -895,6 +1080,20 @@ bool PipelineCompiler::InitFromCurrentGPUState(PipelineInfo* pipelineInfo, const
 		cemu_assert(m_vkGeometryShader == nullptr); // todo - handle cases where the game already provides a GS
 		m_rectEmulationGS = rectsEmulationGS_generate(pipelineInfo->vertexShader, latteRegister);
 		pipelineInfo->rectEmulationGS = m_rectEmulationGS;
+	}
+	else if (LatteGeometryAmp::GetConfig().enabled && m_vkGeometryShader == nullptr &&
+	         (primitiveMode == Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLES ||
+	          primitiveMode == Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLE_STRIP ||
+	          primitiveMode == Latte::LATTE_VGT_PRIMITIVE_TYPE::E_PRIMITIVE_TYPE::TRIANGLE_FAN) &&
+	         pipelineInfo->vertexShader->outputParameterMask != 0)
+	{
+		// deliberately excludes QUADS/QUAD_STRIP/RECTS - those are triangle
+		// topology by the time they reach Vulkan but carry their own emulation
+		// requirements (RECTS needs the 4th-vertex-reconstruction GS above);
+		// only plain triangle draws (the common case for skinned character
+		// meshes, our actual target) get amplified
+		m_geometryAmpGS = geometryAmp_generate(pipelineInfo->vertexShader, latteRegister);
+		pipelineInfo->geometryAmpGS = m_geometryAmpGS;
 	}
 
 	// ##########################################################################################################################################

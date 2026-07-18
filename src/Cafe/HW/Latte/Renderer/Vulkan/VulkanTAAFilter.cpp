@@ -6,6 +6,7 @@
 #include "Cafe/HW/Latte/Renderer/Vulkan/RendererShaderVk.h"
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
 #include "Cafe/HW/Latte/Core/Latte.h"
+#include "Cafe/HW/Latte/Core/LatteCachedFBO.h"
 
 VulkanTAAFilter& VulkanTAAFilter::GetInstance()
 {
@@ -361,6 +362,72 @@ bool VulkanTAAFilter::CreateShaders()
 		"outColor = vec4(flowUV, 1.0, 1.0);\r\n"
 		"}\r\n";
 
+	// analytical (camera-reprojection) motion vectors - see LatteTAA::Config::
+	// useAnalyticalMV. Self-consistent by construction: the NDC point unprojected
+	// (passUV*2-1) is exactly the NDC point THIS fragment's own gl_Position was
+	// rasterized at (same `pos` value in the vertex shader above), so no external
+	// screen-space Y-convention needs to be matched - only that this pass reads
+	// and writes UV in the SAME convention consistently, which it does. Depth
+	// convention matches the RT fork's confirmed-correct kRTHeader (rawDepth*2-1,
+	// i.e. GX2's own projection matrices - baked into the game's vertex shader,
+	// designed for OpenGL-style NDC - expect Z in [-1,1] even though Vulkan
+	// stores/samples raw depth as [0,1]). 2026-07-14: added jitter compensation
+	// on the depth sample (see AnalyticalMVPushConstants::jitterUVx/y comment) -
+	// this pass's own fullscreen triangle isn't jittered, but the GAME's depth
+	// buffer it reads from was rendered with clip-space jitter, so the sample
+	// position needs the same +jitterUV offset every other pass in this filter
+	// uses to read "stabilized" content from a jittered render. FIX (same day):
+	// the NDC X/Y used to unproject that depth sample must be the SAME jittered
+	// position (uvC), not passUV - depth and XY have to describe the same point
+	// on the jittered render, or reconstruction mixes the depth of one screen
+	// location with the XY of another. That mismatch is small on flat surfaces
+	// but large at depth discontinuities (character silhouettes against
+	// background), producing bogus per-edge motion vectors - i.e. ghosting.
+	// The final motion vector below is still expressed relative to passUV
+	// (this pass's true output pixel), only the reconstruction point moves
+	// hybrid combine (2026-07-15): every early-out and the final selection fall
+	// back to the ESTIMATOR's vector (binding 1, the block-matching/optical-flow
+	// result already written to m_mvImage this frame) rather than zero - the
+	// estimator is never worse than nothing, and the analytical vector only
+	// replaces it where the world is verifiably static (agreement) or the
+	// estimator has no confident, materially-different track of its own
+	const char* analyticalMvSrc =
+		"#version 450\r\n"
+		"layout(location = 0) in vec2 passUV;\r\n"
+		"layout(location = 0) out vec4 outColor;\r\n"
+		"layout(binding = 0) uniform sampler2D texDepth;\r\n"
+		"layout(binding = 1) uniform sampler2D texEstMV;\r\n"
+		"layout(push_constant) uniform pushConstants {\r\n"
+		"mat4 invVPCurrent;\r\n"
+		"mat4 vpPrevious;\r\n"
+		"float jitterUVx;\r\n"
+		"float jitterUVy;\r\n"
+		"float disagreePx;\r\n"
+		"float estCostMax;\r\n"
+		"float outputWidth;\r\n"
+		"float outputHeight;\r\n"
+		"}uf_pc;\r\n"
+		"void main(){\r\n"
+		"vec4 est = texture(texEstMV, passUV);\r\n"
+		"vec2 uvC = passUV + vec2(uf_pc.jitterUVx, uf_pc.jitterUVy);\r\n"
+		"float rawDepth = texture(texDepth, uvC).r;\r\n"
+		"vec4 ndcCurrent = vec4(uvC * 2.0 - 1.0, rawDepth * 2.0 - 1.0, 1.0);\r\n"
+		"vec4 worldH = uf_pc.invVPCurrent * ndcCurrent;\r\n"
+		"if (abs(worldH.w) < 1e-5){ outColor = est; return; }\r\n"
+		"vec3 world = worldH.xyz / worldH.w;\r\n"
+		"vec4 prevClip = uf_pc.vpPrevious * vec4(world, 1.0);\r\n"
+		"if (abs(prevClip.w) < 1e-5){ outColor = est; return; }\r\n"
+		"vec2 prevNDC = prevClip.xy / prevClip.w;\r\n"
+		"vec2 prevUV = prevNDC * 0.5 + 0.5;\r\n"
+		"vec2 mvAna = prevUV - passUV;\r\n"
+		"if (any(isnan(mvAna)) || any(isinf(mvAna))){ outColor = est; return; }\r\n"
+		"mvAna = clamp(mvAna, vec2(-2.0), vec2(2.0));\r\n"
+		"vec2 dpx = (mvAna - est.rg) * vec2(uf_pc.outputWidth, uf_pc.outputHeight);\r\n"
+		"bool objectMotion = dot(dpx, dpx) > uf_pc.disagreePx * uf_pc.disagreePx && est.b < uf_pc.estCostMax;\r\n"
+		"vec2 mv = objectMotion ? est.rg : mvAna;\r\n"
+		"outColor = vec4(mv, est.b, 1.0);\r\n"
+		"}\r\n";
+
 	std::string vsStr(vsSrc);
 	m_vertexShader = new RendererShaderVk(RendererShader::ShaderType::kVertex, 0, 0, false, false, vsStr);
 	m_vertexShader->PreponeCompilation(true);
@@ -385,8 +452,12 @@ bool VulkanTAAFilter::CreateShaders()
 	m_ofConvertShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, ofConvertStr);
 	m_ofConvertShader->PreponeCompilation(true);
 
+	std::string analyticalMvStr(analyticalMvSrc);
+	m_analyticalMVShader = new RendererShaderVk(RendererShader::ShaderType::kFragment, 0, 0, false, false, analyticalMvStr);
+	m_analyticalMVShader->PreponeCompilation(true);
+
 	return m_vertexShader != nullptr && m_fragmentShader != nullptr && m_fxaaShader != nullptr && m_mvShader != nullptr
-		&& m_ofInputShader != nullptr && m_ofConvertShader != nullptr;
+		&& m_ofInputShader != nullptr && m_ofConvertShader != nullptr && m_analyticalMVShader != nullptr;
 }
 
 bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
@@ -477,6 +548,63 @@ bool VulkanTAAFilter::CreateStaticObjects(VulkanRenderer* renderer)
 	dsAlloc.descriptorSetCount = kDescriptorRingSize;
 	dsAlloc.pSetLayouts = layouts;
 	if (vkAllocateDescriptorSets(device, &dsAlloc, m_descriptorRing) != VK_SUCCESS)
+		return false;
+
+	// --- analytical motion vectors: fully separate descriptor set layout/
+	// pipeline layout/pool from everything above (see VulkanTAAFilter.h comment)
+	m_analyticalMVSampler = VKRObjectSampler::GetOrCreateSampler(&samplerInfo); // same LINEAR/clamp params as m_sampler
+	if (!m_analyticalMVSampler)
+		return false;
+	m_analyticalMVSampler->incRef();
+
+	// binding 0 = depth, binding 1 = the estimator's MV result (hybrid combine)
+	VkDescriptorSetLayoutBinding analyticalMvBindings[2]{};
+	analyticalMvBindings[0].binding = 0;
+	analyticalMvBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	analyticalMvBindings[0].descriptorCount = 1;
+	analyticalMvBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	analyticalMvBindings[1] = analyticalMvBindings[0];
+	analyticalMvBindings[1].binding = 1;
+	VkDescriptorSetLayoutCreateInfo analyticalMvDslInfo{};
+	analyticalMvDslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	analyticalMvDslInfo.bindingCount = 2;
+	analyticalMvDslInfo.pBindings = analyticalMvBindings;
+	if (vkCreateDescriptorSetLayout(device, &analyticalMvDslInfo, nullptr, &m_analyticalMVDescriptorSetLayout) != VK_SUCCESS)
+		return false;
+
+	VkPushConstantRange analyticalMvPcRange{};
+	analyticalMvPcRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	analyticalMvPcRange.offset = 0;
+	analyticalMvPcRange.size = sizeof(AnalyticalMVPushConstants);
+	VkPipelineLayoutCreateInfo analyticalMvPlInfo{};
+	analyticalMvPlInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	analyticalMvPlInfo.setLayoutCount = 1;
+	analyticalMvPlInfo.pSetLayouts = &m_analyticalMVDescriptorSetLayout;
+	analyticalMvPlInfo.pushConstantRangeCount = 1;
+	analyticalMvPlInfo.pPushConstantRanges = &analyticalMvPcRange;
+	if (vkCreatePipelineLayout(device, &analyticalMvPlInfo, nullptr, &m_analyticalMVPipelineLayout) != VK_SUCCESS)
+		return false;
+
+	VkDescriptorPoolSize analyticalMvPoolSize{};
+	analyticalMvPoolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	analyticalMvPoolSize.descriptorCount = kAnalyticalMVRingSize * 2; // 2 bindings per set (depth + estimator MV)
+	VkDescriptorPoolCreateInfo analyticalMvPoolInfo{};
+	analyticalMvPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	analyticalMvPoolInfo.maxSets = kAnalyticalMVRingSize;
+	analyticalMvPoolInfo.poolSizeCount = 1;
+	analyticalMvPoolInfo.pPoolSizes = &analyticalMvPoolSize;
+	if (vkCreateDescriptorPool(device, &analyticalMvPoolInfo, nullptr, &m_analyticalMVDescriptorPool) != VK_SUCCESS)
+		return false;
+
+	VkDescriptorSetLayout analyticalMvLayouts[kAnalyticalMVRingSize];
+	for (uint32 i = 0; i < kAnalyticalMVRingSize; i++)
+		analyticalMvLayouts[i] = m_analyticalMVDescriptorSetLayout;
+	VkDescriptorSetAllocateInfo analyticalMvDsAlloc{};
+	analyticalMvDsAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	analyticalMvDsAlloc.descriptorPool = m_analyticalMVDescriptorPool;
+	analyticalMvDsAlloc.descriptorSetCount = kAnalyticalMVRingSize;
+	analyticalMvDsAlloc.pSetLayouts = analyticalMvLayouts;
+	if (vkAllocateDescriptorSets(device, &analyticalMvDsAlloc, m_analyticalMVDescriptorRing) != VK_SUCCESS)
 		return false;
 
 	return true;
@@ -608,6 +736,54 @@ bool VulkanTAAFilter::CreateSizedObjects(VulkanRenderer* renderer)
 	std::array<VKRObjectTextureView*, 1> mvFbAttachments{ m_mvViewObj };
 	m_mvFramebuffer = new VKRObjectFramebuffer(m_mvRenderPass, mvFbAttachments, Vector2i(m_mvWidth, m_mvHeight));
 
+	// hybrid MV output (see VulkanTAAFilter.h): identical second target on the same
+	// render pass, written by the analytical combine pass while it READS m_mvImage
+	{
+		VkImageCreateInfo imgInfo{};
+		imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imgInfo.imageType = VK_IMAGE_TYPE_2D;
+		imgInfo.format = mvFormat;
+		imgInfo.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight, 1 };
+		imgInfo.mipLevels = 1;
+		imgInfo.arrayLayers = 1;
+		imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		if (vkCreateImage(device, &imgInfo, nullptr, &m_mvFinalImage) != VK_SUCCESS)
+			return false;
+
+		VkMemoryRequirements memReq;
+		vkGetImageMemoryRequirements(device, m_mvFinalImage, &memReq);
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memReq.size;
+		allocInfo.memoryTypeIndex = FindMemoryType(renderer->GetPhysicalDevice(), memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &m_mvFinalMemory) != VK_SUCCESS)
+			return false;
+		vkBindImageMemory(device, m_mvFinalImage, m_mvFinalMemory, 0);
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = m_mvFinalImage;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = mvFormat;
+		viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		VkImageView rawView = VK_NULL_HANDLE;
+		if (vkCreateImageView(device, &viewInfo, nullptr, &rawView) != VK_SUCCESS)
+			return false;
+
+		m_mvFinalTexObj = new VKRObjectTexture();
+		m_mvFinalTexObj->m_image = m_mvFinalImage;
+		m_mvFinalTexObj->m_format = mvFormat;
+		m_mvFinalTexObj->m_imageAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+		m_mvFinalViewObj = new VKRObjectTextureView(m_mvFinalTexObj, rawView);
+		m_mvFinalLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		std::array<VKRObjectTextureView*, 1> mvFinalFbAttachments{ m_mvFinalViewObj };
+		m_mvFinalFramebuffer = new VKRObjectFramebuffer(m_mvRenderPass, mvFinalFbAttachments, Vector2i(m_mvWidth, m_mvHeight));
+	}
+
 	// graphics pipeline (fullscreen triangle, no vertex input, static viewport)
 	VkPipelineShaderStageCreateInfo stages[2]{};
 	stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -700,6 +876,14 @@ bool VulkanTAAFilter::CreateSizedObjects(VulkanRenderer* renderer)
 	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineMV) != VK_SUCCESS)
 		return false;
 
+	// fourth pipeline: analytical motion vectors, own layout (see
+	// VulkanTAAFilter.h comment) - renderPass stays m_mvRenderPass from above,
+	// same target/size/format as the block-matching search's output
+	stages[1].module = m_analyticalMVShader->GetShaderModule();
+	pipelineInfo.layout = m_analyticalMVPipelineLayout;
+	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_pipelineAnalyticalMV) != VK_SUCCESS)
+		return false;
+
 	return true;
 }
 
@@ -774,6 +958,30 @@ void VulkanTAAFilter::ReleaseResources(VulkanRenderer* renderer)
 		m_mvTexObj = nullptr;
 	}
 	m_mvLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (m_mvFinalImage != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ m_mvFinalImage, m_mvFinalMemory, VK_NULL_HANDLE, releaseCmdBufferId });
+		m_mvFinalImage = VK_NULL_HANDLE;
+		m_mvFinalMemory = VK_NULL_HANDLE;
+	}
+	if (m_mvFinalFramebuffer)
+	{
+		renderer->ReleaseDestructibleObject(m_mvFinalFramebuffer);
+		m_mvFinalFramebuffer = nullptr;
+	}
+	if (m_mvFinalViewObj)
+	{
+		renderer->ReleaseDestructibleObject(m_mvFinalViewObj);
+		m_mvFinalViewObj = nullptr;
+	}
+	if (m_mvFinalTexObj)
+	{
+		m_mvFinalTexObj->m_image = VK_NULL_HANDLE;
+		renderer->ReleaseDestructibleObject(m_mvFinalTexObj);
+		m_mvFinalTexObj = nullptr;
+	}
+	m_mvFinalLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	m_mvHybridValidThisFrame = false;
 	if (m_mvRenderPass)
 	{
 		renderer->ReleaseDestructibleObject(m_mvRenderPass);
@@ -783,6 +991,11 @@ void VulkanTAAFilter::ReleaseResources(VulkanRenderer* renderer)
 	{
 		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipelineMV, releaseCmdBufferId });
 		m_pipelineMV = VK_NULL_HANDLE;
+	}
+	if (m_pipelineAnalyticalMV != VK_NULL_HANDLE)
+	{
+		m_pendingDeletes.push_back({ VK_NULL_HANDLE, VK_NULL_HANDLE, m_pipelineAnalyticalMV, releaseCmdBufferId });
+		m_pipelineAnalyticalMV = VK_NULL_HANDLE;
 	}
 	ReleaseOpticalFlowSession(renderer);
 }
@@ -1475,8 +1688,167 @@ bool VulkanTAAFilter::UpdateOpticalFlow(VulkanRenderer* renderer, VkCommandBuffe
 	return producedResult;
 }
 
+// hybrid (RTX-Remix-style) motion vector combine - see LatteTAA::Config::
+// useAnalyticalMV and VulkanTAAFilter.h's comment above the members this uses.
+// Runs AFTER the estimator has written m_mvImage: reads it (binding 1) plus
+// depth (binding 0), computes the camera-reprojection vector per pixel, and
+// writes the per-pixel selection into m_mvFinalImage. Returns false (no-op)
+// when the camera isn't locked yet or no usable depth is available this frame
+// - consumers then keep reading the estimator's m_mvImage directly.
+bool VulkanTAAFilter::ApplyAnalyticalMV(VulkanRenderer* renderer, VkCommandBuffer cmd)
+{
+	if (!renderer->HasValidCameraVP())
+		return false;
+
+	// depth resolution: same 3-tier fallback (current attachment -> this-frame
+	// bind -> cross-frame cache) as VulkanSSAOFilter/VulkanDLSSFilter, see their
+	// NotifyDepthBind comments for the cutscene-camera-cut rationale
+	LatteTextureView* depthView = LatteMRT::GetDepthAttachment();
+	LatteTextureVk* depthTexVk = nullptr;
+	sint32 depthWidth = 0, depthHeight = 0;
+	bool haveDepth = false;
+	if (depthView && depthView->baseTexture)
+	{
+		depthTexVk = (LatteTextureVk*)depthView->baseTexture;
+		depthTexVk->GetEffectiveSize(depthWidth, depthHeight, depthView->firstMip);
+		if (depthWidth == m_width && depthHeight == m_height)
+		{
+			haveDepth = true;
+			m_cachedDepthView = depthView;
+		}
+	}
+	if (!haveDepth && m_frameDepthView && m_frameDepthView->baseTexture)
+	{
+		LatteTextureVk* frameTexVk = (LatteTextureVk*)m_frameDepthView->baseTexture;
+		sint32 frameWidth = 0, frameHeight = 0;
+		frameTexVk->GetEffectiveSize(frameWidth, frameHeight, m_frameDepthView->firstMip);
+		if (frameWidth == m_width && frameHeight == m_height)
+		{
+			depthView = m_frameDepthView;
+			depthTexVk = frameTexVk;
+			haveDepth = true;
+			m_cachedDepthView = depthView;
+		}
+	}
+	if (!haveDepth && m_cachedDepthView && m_cachedDepthView->baseTexture)
+	{
+		LatteTextureVk* cachedTexVk = (LatteTextureVk*)m_cachedDepthView->baseTexture;
+		sint32 cachedWidth = 0, cachedHeight = 0;
+		cachedTexVk->GetEffectiveSize(cachedWidth, cachedHeight, m_cachedDepthView->firstMip);
+		if (cachedWidth == m_width && cachedHeight == m_height)
+		{
+			depthView = m_cachedDepthView;
+			depthTexVk = cachedTexVk;
+			haveDepth = true;
+		}
+	}
+	if (!haveDepth)
+		return false;
+
+	LatteTextureViewVk* depthViewVk = (LatteTextureViewVk*)depthView;
+	VkDevice device = renderer->GetLogicalDevice();
+
+	m_mvRenderPass->flagForCurrentCommandBuffer();
+	m_mvFinalFramebuffer->flagForCurrentCommandBuffer();
+	m_mvFinalViewObj->flagForCurrentCommandBuffer();
+	m_mvViewObj->flagForCurrentCommandBuffer(); // estimator result, read at binding 1
+	m_analyticalMVSampler->flagForCurrentCommandBuffer();
+
+	// depth barrier - never touched elsewhere in this filter, always needs its
+	// own read transition (same idiom as VulkanSSAOFilter's depth barrier)
+	const uint32 depthMip = (uint32)depthView->firstMip;
+	const uint32 depthSlice = (uint32)depthView->firstSlice;
+	VkImage depthImage = depthTexVk->GetImageObj()->m_image;
+	VkImageSubresource depthSubres{ VK_IMAGE_ASPECT_DEPTH_BIT, depthMip, depthSlice };
+	VkImageLayout depthLayout = depthTexVk->GetImageLayout(depthSubres);
+	{
+		VkImageMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.oldLayout = depthLayout;
+		barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image = depthImage;
+		barrier.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, depthMip, 1, depthSlice, 1 };
+		barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+							 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+	}
+	VkImageSubresourceRange depthRange{ VK_IMAGE_ASPECT_DEPTH_BIT, depthMip, 1, depthSlice, 1 };
+	depthTexVk->SetImageLayout(depthRange, VK_IMAGE_LAYOUT_GENERAL);
+
+	VKRObjectTextureView* depthViewObj = depthViewVk->GetViewRGBA();
+	depthViewObj->flagForCurrentCommandBuffer();
+	VkImageView depthViewRaw = depthViewObj->m_textureImageView;
+
+	// the hybrid writes m_mvFinalImage; m_mvImage (the estimator's output, written
+	// earlier this same Apply and already transitioned to shader-read by that path)
+	// is consumed at binding 1. Only the final image needs the attachment barrier
+	_taaBarrierImage(cmd, m_mvFinalImage, m_mvFinalLayout, VK_IMAGE_LAYOUT_GENERAL,
+					 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	m_mvFinalLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+	VkDescriptorSet analyticalMvDescSet = m_analyticalMVDescriptorRing[m_analyticalMVDescriptorRingIndex];
+	m_analyticalMVDescriptorRingIndex = (m_analyticalMVDescriptorRingIndex + 1) % kAnalyticalMVRingSize;
+	VkDescriptorImageInfo analyticalMvImageInfos[2]{
+		{ m_analyticalMVSampler->GetSampler(), depthViewRaw, VK_IMAGE_LAYOUT_GENERAL },
+		{ m_analyticalMVSampler->GetSampler(), m_mvViewObj->m_textureImageView, VK_IMAGE_LAYOUT_GENERAL },
+	};
+	VkWriteDescriptorSet analyticalMvWrites[2]{};
+	for (uint32 b = 0; b < 2; b++)
+	{
+		analyticalMvWrites[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		analyticalMvWrites[b].dstSet = analyticalMvDescSet;
+		analyticalMvWrites[b].dstBinding = b;
+		analyticalMvWrites[b].descriptorCount = 1;
+		analyticalMvWrites[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		analyticalMvWrites[b].pImageInfo = &analyticalMvImageInfos[b];
+	}
+	vkUpdateDescriptorSets(device, 2, analyticalMvWrites, 0, nullptr);
+
+	VkRenderPassBeginInfo rpBegin{};
+	rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	rpBegin.renderPass = m_mvRenderPass->m_renderPass;
+	rpBegin.framebuffer = m_mvFinalFramebuffer->m_frameBuffer;
+	rpBegin.renderArea.extent = { (uint32)m_mvWidth, (uint32)m_mvHeight };
+	vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineAnalyticalMV);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_analyticalMVPipelineLayout, 0, 1, &analyticalMvDescSet, 0, nullptr);
+
+	VkViewport mvViewport{ 0.0f, 0.0f, (float)m_mvWidth, (float)m_mvHeight, 0.0f, 1.0f };
+	vkCmdSetViewport(cmd, 0, 1, &mvViewport);
+	VkRect2D mvScissor{ {0, 0}, { (uint32)m_mvWidth, (uint32)m_mvHeight } };
+	vkCmdSetScissor(cmd, 0, 1, &mvScissor);
+
+	float jitterPxX = 0.0f, jitterPxY = 0.0f;
+	LatteTAA::GetCurrentFrameJitter(jitterPxX, jitterPxY);
+
+	AnalyticalMVPushConstants pc{};
+	std::memcpy(pc.invVPCurrent, renderer->GetCameraInvVPColMajor(), sizeof(pc.invVPCurrent));
+	std::memcpy(pc.vpPrevious, renderer->GetCameraPrevVPColMajor(), sizeof(pc.vpPrevious));
+	pc.jitterUVx = jitterPxX / (float)m_width;
+	pc.jitterUVy = jitterPxY / (float)m_height;
+	pc.disagreePx = LatteTAA::GetConfig().mvHybridDisagreePx;
+	pc.estCostMax = LatteTAA::GetConfig().mvHybridCostMax;
+	pc.outputWidth = (float)m_width;
+	pc.outputHeight = (float)m_height;
+	vkCmdPushConstants(cmd, m_analyticalMVPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+	vkCmdDraw(cmd, 3, 1, 0, 0);
+	vkCmdEndRenderPass(cmd);
+
+	_taaBarrierImage(cmd, m_mvFinalImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+					 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+					 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+	return true;
+}
+
 void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanoutView)
 {
+	m_resolvedLastCall = false;
+	m_mvHybridValidThisFrame = false; // set again only if the hybrid combine runs below
 	auto& config = LatteTAA::GetConfig();
 	if (!config.enabled)
 		return;
@@ -1588,11 +1960,13 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	// toggle - that toggle only gates whether the resolve below ACTS on the
 	// result, so A/B testing never has to pay for a different barrier/descriptor
 	// path and the MV texture is never read while genuinely uninitialized.
-	// Two possible sources write into the same m_mvImage (UV-space RG offset):
-	// hardware optical flow (VK_NV_optical_flow, real motion estimation, see
-	// LatteTAA::Config::useOpticalFlow) when available+enabled, else the
-	// block-matching search below. Downstream (this filter's resolve, DLAA) never
-	// needs to know which one ran.
+	// The ESTIMATOR (hardware optical flow when available+enabled, else the
+	// block-matching search below) always writes m_mvImage. When
+	// LatteTAA::Config::useAnalyticalMV is on, a HYBRID combine pass then runs
+	// after it (ApplyAnalyticalMV): camera-exact reprojection wherever the
+	// estimator doesn't confidently disagree, the estimator's vector where it
+	// does (animated objects) - writing m_mvFinalImage, which consumers read
+	// on those frames (m_mvHybridValidThisFrame) instead of m_mvImage.
 	if (!config.useFxaa)
 	{
 		if (config.useOpticalFlow && renderer->IsOpticalFlowAvailable() && !m_ofSessionValid && !m_ofUnsupported)
@@ -1671,6 +2045,13 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 							 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
 							 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 		}
+
+		// hybrid combine, AFTER the estimator so m_mvImage holds this frame's
+		// result (both estimator paths above leave it shader-readable). No-ops
+		// (returns false) when the camera probe isn't locked or depth is missing
+		// - consumers then read the estimator's m_mvImage directly, as before
+		if (config.useAnalyticalMV)
+			m_mvHybridValidThisFrame = ApplyAnalyticalMV(renderer, cmd);
 	}
 
 	// update the next descriptor set in the ring
@@ -1685,9 +2066,11 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	imageInfos[1].imageView = m_viewObj[srcIdx]->m_textureImageView;
 	imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 	// always bound (even in FXAA mode, where it just holds stale/unused data -
-	// the FXAA shader never samples it and useMotionVectors is forced 0 below)
+	// the FXAA shader never samples it and useMotionVectors is forced 0 below).
+	// On frames where the hybrid combine ran, the refined m_mvFinalImage is what
+	// the resolve should reproject through, not the raw estimator output
 	imageInfos[2].sampler = m_sampler->GetSampler();
-	imageInfos[2].imageView = m_mvViewObj->m_textureImageView;
+	imageInfos[2].imageView = (m_mvHybridValidThisFrame && m_mvFinalViewObj) ? m_mvFinalViewObj->m_textureImageView : m_mvViewObj->m_textureImageView;
 	imageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
 	VkWriteDescriptorSet writes[kDescriptorBindings]{};
@@ -1778,8 +2161,24 @@ void VulkanTAAFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanou
 	m_hasValidOutput = true;
 	m_lastDrawCallCounter = LatteGPUState.drawCallCounter;
 	m_lastSceneDrawCounter = sceneDrawCounter;
+	// NotifyFramePresented (advances the Halton jitter index) moved to
+	// LatteRenderTarget_copyToBackbuffer, AFTER the whole TAA->DLAA->SSAO chain -
+	// it used to fire here, but DLAA and SSAO both run later in that chain and
+	// both read LatteTAA::GetCurrentFrameJitter() to de-jitter the depth/color
+	// they were handed. Advancing here meant they read NEXT frame's jitter value
+	// against THIS frame's actually-rendered (this-frame-jittered) data - a
+	// real, silent off-by-one inconsistency between what jitter offset a pass
+	// is TOLD versus what was actually baked into the pixels it reads. DLAA/NGX
+	// unprojects depth using that offset internally; a wrong offset there is
+	// exactly the kind of mismatch that produces garbage reprojection at depth
+	// discontinuities (character silhouettes) - shredded/"glass" looking edges.
+	// m_resolvedLastCall tells that new call site whether THIS call reached this
+	// point (a genuine resolve) rather than one of the early-returns above -
+	// without that check the jitter index would advance on every copyToBackbuffer
+	// call regardless of whether TAA actually did anything, racing ahead of real
+	// frames on exactly the re-present patterns those early-returns exist to skip
 	if (!config.useFxaa)
-		LatteTAA::NotifyFramePresented();
+		m_resolvedLastCall = true;
 }
 
 VkDescriptorSet VulkanTAAFilter::GetPresentDescriptorSet(VulkanRenderer* renderer, VkDescriptorSetLayout blitLayout,
@@ -1863,6 +2262,16 @@ VkImageView VulkanTAAFilter::GetMotionVectorsViewIfValid(sint32& outWidth, sint3
 	// the MV pass at all - m_mvViewObj could be stale from a mode switch.
 	if (!m_hasValidOutput || LatteTAA::GetConfig().useFxaa)
 		return VK_NULL_HANDLE;
+	// on frames where the hybrid combine ran, the refined result is the one DLAA
+	// should consume (same size/format, different image)
+	if (m_mvHybridValidThisFrame && m_mvFinalViewObj)
+	{
+		m_mvFinalViewObj->flagForCurrentCommandBuffer();
+		outWidth = m_mvWidth;
+		outHeight = m_mvHeight;
+		outImage = m_mvFinalImage;
+		return m_mvFinalViewObj->m_textureImageView;
+	}
 	if (!m_mvViewObj)
 		return VK_NULL_HANDLE;
 	m_mvViewObj->flagForCurrentCommandBuffer();
@@ -1872,8 +2281,30 @@ VkImageView VulkanTAAFilter::GetMotionVectorsViewIfValid(sint32& outWidth, sint3
 	return m_mvViewObj->m_textureImageView;
 }
 
+void VulkanTAAFilter::NotifyTextureDeletion(LatteTexture* texture)
+{
+	if (m_cachedDepthView && m_cachedDepthView->baseTexture == texture)
+		m_cachedDepthView = nullptr;
+	if (m_frameDepthView && m_frameDepthView->baseTexture == texture)
+		m_frameDepthView = nullptr;
+}
+
+void VulkanTAAFilter::NotifyDepthBind(LatteTextureView* view)
+{
+	// m_width/m_height hold the scene output size from the last completed
+	// Apply(); before the first one there is nothing to match against yet
+	if (!view || !view->baseTexture || m_width <= 0)
+		return;
+	sint32 w = 0, h = 0;
+	view->baseTexture->GetEffectiveSize(w, h, view->firstMip);
+	if (w == m_width && h == m_height)
+		m_frameDepthView = view;
+}
+
 void VulkanTAAFilter::Shutdown(VulkanRenderer* renderer)
 {
+	m_cachedDepthView = nullptr;
+	m_frameDepthView = nullptr;
 	ReleaseResources(renderer);
 	VkDevice device = renderer->GetLogicalDevice();
 	for (auto& pd : m_pendingDeletes)
@@ -1916,6 +2347,26 @@ void VulkanTAAFilter::Shutdown(VulkanRenderer* renderer)
 		m_ofFlowSampler->decRef();
 		m_ofFlowSampler = nullptr;
 	}
+	if (m_analyticalMVDescriptorPool != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorPool(device, m_analyticalMVDescriptorPool, nullptr);
+		m_analyticalMVDescriptorPool = VK_NULL_HANDLE;
+	}
+	if (m_analyticalMVPipelineLayout != VK_NULL_HANDLE)
+	{
+		vkDestroyPipelineLayout(device, m_analyticalMVPipelineLayout, nullptr);
+		m_analyticalMVPipelineLayout = VK_NULL_HANDLE;
+	}
+	if (m_analyticalMVDescriptorSetLayout != VK_NULL_HANDLE)
+	{
+		vkDestroyDescriptorSetLayout(device, m_analyticalMVDescriptorSetLayout, nullptr);
+		m_analyticalMVDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+	if (m_analyticalMVSampler)
+	{
+		m_analyticalMVSampler->decRef();
+		m_analyticalMVSampler = nullptr;
+	}
 }
 
 // member of VulkanRenderer so the filter can be driven from common Latte code
@@ -1936,6 +2387,11 @@ void VulkanRenderer::TAA_Apply(LatteTextureView* textureView)
 	m_state.currentPipeline = VK_NULL_HANDLE;
 	vkCmdSetViewport(m_state.currentCommandBuffer, 0, 1, &m_state.currentViewport);
 	vkCmdSetScissor(m_state.currentCommandBuffer, 0, 1, &m_state.currentScissorRect);
+}
+
+bool VulkanRenderer::TAA_DidResolveLastCall()
+{
+	return VulkanTAAFilter::GetInstance().DidResolveLastCall();
 }
 
 VkCommandBuffer VulkanRenderer::TAA_GetCommandBuffer()

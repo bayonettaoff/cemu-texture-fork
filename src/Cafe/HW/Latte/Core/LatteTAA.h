@@ -5,6 +5,9 @@
 // clamping at scanout time. Without motion vectors the clamp rejects stale history
 // in moving regions, so quality degrades to no-AA there instead of ghosting.
 
+class LatteTexture;
+class LatteTextureView;
+
 namespace LatteTAA
 {
 	struct Config
@@ -108,9 +111,49 @@ namespace LatteTAA
 		// back to the block-matching search when the extension isn't available.
 		// Default off (opt-in, CEMU_TAA_OPTICALFLOW) until validated in-game.
 		bool useOpticalFlow{ false };
+		// analytical (camera-reprojection) motion vectors, RTX-Remix-inspired (see
+		// VulkanRenderer::ProbeVPMatrix, ported 2026-07-14): reconstructs each
+		// pixel's world position from depth + the CURRENT frame's camera, then
+		// reprojects it with the PREVIOUS frame's camera to get an exact motion
+		// vector - no per-pixel search/estimation needed, unlike the two options
+		// above. Reprojection math validated (see session notes: NDC round-trip
+		// through VP/invVP was exact 0,0, and the delta responded to real camera
+		// movement) before wiring this in. LIMITATION: assumes nothing in world
+		// space moved except the camera - correct for static background/environment
+		// geometry, WRONG for anything animated (characters get a motion vector
+		// that only reflects camera-induced parallax, not their own movement).
+		// UPGRADED 2026-07-15 from "replaces the estimator entirely" to a
+		// per-pixel HYBRID, mirroring what RTX Remix effectively does (exact
+		// reprojection for non-animated surfaces, real motion data where things
+		// move): the estimator (block-matching/optical flow) runs as always, and
+		// a combine pass picks per pixel - analytical where the world is static
+		// (exact, sub-pixel), the estimator's vector where it confidently
+		// disagrees (animated characters, which camera reprojection cannot see).
+		// Default ON as of 2026-07-15 (user request: TAA and DLAA should always
+		// use the best motion vectors available without extra toggling) - safe as
+		// a default because the hybrid no-ops cleanly into plain estimator output
+		// whenever the camera probe isn't locked or depth is unavailable.
+		// CEMU_TAA_ANALYTICALMV=0 or the Debug menu checkbox turn it off for A/B
+		bool useAnalyticalMV{ true };
+		// hybrid selection tuning (see AnalyticalMVPushConstants in
+		// VulkanTAAFilter.h): estimator wins when it disagrees with analytical by
+		// more than this many full-res pixels... (CEMU_TAA_MVH_DISAGREE)
+		float mvHybridDisagreePx{ 3.0f };
+		// ...AND its block-match cost signals a confident track (CEMU_TAA_MVH_COST)
+		float mvHybridCostMax{ 0.25f };
 	};
 
 	Config& GetConfig();
+
+	// forwards to VulkanTAAFilter's cached-depth-fallback invalidation (Vulkan
+	// only; a no-op otherwise) - needed by useAnalyticalMV's depth reconstruction.
+	// Called from LatteTexture_Delete
+	void NotifyTextureDeletion(LatteTexture* texture);
+
+	// called from LatteMRT::SetDepthAndStencilAttachment on every depth bind, so
+	// useAnalyticalMV can capture the scene's depth buffer DURING the frame -
+	// same rationale as LatteSSAO::NotifyDepthBind
+	void NotifyDepthBind(LatteTextureView* view);
 
 	// per-frame jitter sequence (Halton 2/3), advanced once per presented frame
 	void NotifyFramePresented();
@@ -128,23 +171,51 @@ namespace LatteTAA
 	//   tests AND writes depth; post-process quads often leave the test on with
 	//   func=always but never write, and jittering those shatters depth-based
 	//   effects (e.g. per-object motion blur)
-	// - hasColorBuffer: at least one color attachment bound
 	// - vpWidth/vpHeight: viewport size after graphic pack scaling
 	// - rtWidth/rtHeight: effective size of the active render target
-	bool GetViewportJitter(bool depthTestEnabled, bool depthWriteEnabled, bool hasColorBuffer,
+	//
+	// Z-PREPASS FIX (2026-07-14, the root cause of "shattered glass" geometry with
+	// jitter on): this used to also require a bound color buffer, deliberately
+	// excluding depth-only passes. But Bayonetta 2 (and many engines) renders a
+	// full CAMERA-SPACE Z-PREPASS at scene resolution before the color passes -
+	// confirmed via RenderDoc (Depth-only Pass #1-#3, viewport exactly the
+	// 3840x2160 scene size, hundreds of draws). Jittering the color pass but not
+	// the prepass makes the same triangle rasterize at different sub-pixel
+	// positions in the two passes, so the color pass FAILS the depth test along
+	// every silhouette/steep slope (fragments killed - pixel history shows only
+	// the clear touching those pixels) and the game's own depth+color post-effects
+	// combine desynced inputs. Every camera-space pass in a frame must share one
+	// jitter offset, so depth-only passes are now jittered too. Shadow maps
+	// (light-space, must NOT be jittered) are excluded by the size checks: they
+	// are square atlases (4096x4096 viewport in a 4096x8192 atlas here) whose
+	// dimensions don't match the scene output size - the RT-vs-output comparison
+	// below is two-sided (not just "big enough") precisely so an oversized shadow
+	// map can't slip through
+	bool GetViewportJitter(bool depthTestEnabled, bool depthWriteEnabled,
 						   float vpWidth, float vpHeight,
 						   sint32 rtWidth, sint32 rtHeight,
 						   float& jitterX, float& jitterY);
 
-	// clip-space jitter mode only (Config::clipSpaceJitter): the render-target-pixel
-	// jitter offset for the draw currently being set up, so the Vulkan renderer's
-	// uniform upload (which runs per-draw, in a different file, right before the
-	// actual draw call) can convert it to clip-space units and feed the shader's
-	// uf_taaJitter uniform. Set by LatteRenderTarget_updateViewport right after
-	// calling GetViewportJitter above - always call Set with (0,0) for draws that
-	// aren't jittered so no value leaks from a previous jittered draw
-	void SetCurrentDrawJitterPixels(float jitterX, float jitterY);
-	void GetCurrentDrawJitterPixels(float& jitterX, float& jitterY);
+	// clip-space jitter mode only (Config::clipSpaceJitter): the CLIP-SPACE jitter
+	// offset for the draw currently being set up, ready to be written verbatim into
+	// the shader's uf_taaJitter uniform by the Vulkan renderer's per-draw uniform
+	// upload (VulkanRendererCore.cpp). Set by LatteRenderTarget_updateViewport right
+	// after calling GetViewportJitter above - always call Set with (0,0) for draws
+	// that aren't jittered so no value leaks from a previous jittered draw.
+	// UNIT-MISMATCH FIX (2026-07-14): the pixel->clip conversion happens at the
+	// call site in LatteRenderTarget_updateViewport using the graphic-pack-SCALED
+	// viewport of that exact draw (the render target it actually rasterizes into).
+	// It previously happened at the uniform-upload site dividing by
+	// LatteRenderTarget_GetCurrentVirtualViewportSize - the game's NATIVE viewport
+	// (e.g. 1280x720 for Bayonetta 2) - while GetViewportJitter's offset is in
+	// EFFECTIVE render-target pixels (e.g. 3840x2160 with a 3x graphic pack). That
+	// inflated the on-screen jitter by the internal-resolution multiplier (3x at
+	// 4K: +-1.5px applied, while the TAA resolve/DLSS/SSAO all un-jitter by the
+	// intended +-0.5px), folding a permanent ~1px alternating misalignment into
+	// the temporal history - visible as shimmering/"shattered glass" edges in any
+	// 3D content whenever jitter was on and internal resolution exceeded native
+	void SetCurrentDrawJitterClipSpace(float jitterClipX, float jitterClipY);
+	void GetCurrentDrawJitterClipSpace(float& jitterClipX, float& jitterClipY);
 
 	// jitter offset (render-target pixels) that scene passes used this frame; the
 	// resolve pass needs it to sample the current frame at unjittered positions.

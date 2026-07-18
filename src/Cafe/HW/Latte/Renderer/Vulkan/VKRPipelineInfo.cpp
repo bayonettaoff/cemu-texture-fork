@@ -56,6 +56,12 @@ PipelineInfo::~PipelineInfo()
 		rectEmulationGS = nullptr;
 	}
 
+	if (geometryAmpGS)
+	{
+		delete geometryAmpGS;
+		geometryAmpGS = nullptr;
+	}
+
 	// delete descriptor sets
 	while (!pixel_ds_cache.empty())
 	{

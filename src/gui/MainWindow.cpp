@@ -27,6 +27,7 @@
 #include "config/ActiveSettings.h"
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
 #include "Cafe/HW/Latte/Core/LatteSSAO.h"
+#include "Cafe/HW/Latte/Core/LatteGeometryAmp.h"
 #include "Cafe/HW/Latte/Core/LatteDLSS.h"
 #include "Cafe/HW/Latte/Core/LatteTextureReplacement.h"
 #include "config/LaunchSettings.h"
@@ -151,18 +152,24 @@ enum
 	MAINFRAME_MENU_ID_DEBUG_DUMP_FST,
 	MAINFRAME_MENU_ID_DEBUG_DUMP_CURL_REQUESTS,
 	// debug->anti-aliasing
-	MAINFRAME_MENU_ID_DEBUG_TAA = 21620,
-	MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL,
+	// debug->anti-aliasing mode: radio group (off / FXAA / TAA / DLAA), one click
+	// per mode instead of the old three interdependent checkboxes (enable-gate +
+	// FXAA-vs-temporal + DLAA) that had to be flipped in the right combination
+	MAINFRAME_MENU_ID_DEBUG_AA_OFF = 21620,
+	MAINFRAME_MENU_ID_DEBUG_AA_FXAA,
+	MAINFRAME_MENU_ID_DEBUG_AA_TAA,
+	MAINFRAME_MENU_ID_DEBUG_AA_DLAA,
 	// debug->texture replacement
 	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP = 21630,
 	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD,
 	MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET,
 	// debug->screen-space effects (one toggle drives HBAO + SSR + contact shadows)
 	MAINFRAME_MENU_ID_DEBUG_SSAO = 21640,
-	// debug->DLAA (NVIDIA NGX/DLSS, real neural-net temporal AA - see LatteDLSS.h)
-	MAINFRAME_MENU_ID_DEBUG_DLAA = 21641,
-	// debug->hardware optical flow motion vectors (VK_NV_optical_flow, see LatteTAA.h)
-	MAINFRAME_MENU_ID_DEBUG_OPTICALFLOW = 21642,
+	// (21641 was the standalone DLAA checkbox - folded into the AA radio group;
+	//  21642/21644 were the motion-vector toggles - removed, TAA/DLAA always use
+	//  the best MV source automatically, env vars remain as debug overrides)
+	// debug->geometry amplification (1->4 triangle subdivision, see LatteGeometryAmp.h)
+	MAINFRAME_MENU_ID_DEBUG_GEOMETRYAMP = 21643,
 	// help
 	MAINFRAME_MENU_ID_HELP_ABOUT = 21700,
 	MAINFRAME_MENU_ID_HELP_UPDATE,
@@ -222,11 +229,12 @@ EVT_MENU_RANGE(MAINFRAME_MENU_ID_DEBUG_LOGGING0 + 0, MAINFRAME_MENU_ID_DEBUG_LOG
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_ADVANCED_PPC_INFO, MainWindow::OnPPCInfoToggle)
 // debug -> dump menu
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DUMP_TEXTURES, MainWindow::OnDebugDumpUsedTextures)
-EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA, MainWindow::OnDebugTAAToggle)
-EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL, MainWindow::OnDebugTAATemporalToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_AA_OFF, MainWindow::OnDebugAAModeSelect)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_AA_FXAA, MainWindow::OnDebugAAModeSelect)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_AA_TAA, MainWindow::OnDebugAAModeSelect)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_AA_DLAA, MainWindow::OnDebugAAModeSelect)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_SSAO, MainWindow::OnDebugSSAOToggle)
-EVT_MENU(MAINFRAME_MENU_ID_DEBUG_DLAA, MainWindow::OnDebugDLAAToggle)
-EVT_MENU(MAINFRAME_MENU_ID_DEBUG_OPTICALFLOW, MainWindow::OnDebugOpticalFlowToggle)
+EVT_MENU(MAINFRAME_MENU_ID_DEBUG_GEOMETRYAMP, MainWindow::OnDebugGeometryAmpToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, MainWindow::OnDebugTexReplaceDumpToggle)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, MainWindow::OnDebugTexReplaceReload)
 EVT_MENU(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, MainWindow::OnDebugTexReplaceForget)
@@ -1130,26 +1138,26 @@ void MainWindow::OnDebugDumpUsedTextures(wxCommandEvent& event)
 	}
 }
 
-void MainWindow::OnDebugTAAToggle(wxCommandEvent& event)
+// one radio group drives the whole anti-aliasing stack: each mode sets the
+// right combination of LatteTAA (enable gate + FXAA-vs-temporal) and LatteDLSS
+// flags that previously had to be flipped through three separate checkboxes.
+// DLAA implies the temporal pipeline (it consumes its motion vectors + jitter)
+void MainWindow::OnDebugAAModeSelect(wxCommandEvent& event)
 {
-	LatteTAA::GetConfig().enabled = event.IsChecked();
+	auto& taa = LatteTAA::GetConfig();
+	const int id = event.GetId();
+	taa.enabled = (id != MAINFRAME_MENU_ID_DEBUG_AA_OFF);
+	taa.useFxaa = (id == MAINFRAME_MENU_ID_DEBUG_AA_FXAA);
+	LatteDLSS::GetConfig().enabled = (id == MAINFRAME_MENU_ID_DEBUG_AA_DLAA);
 	LatteTAA::InvalidateHistory();
 	// menu toggles don't otherwise leave any trace in the log, so there was no
-	// way to confirm from log.txt alone whether a checkbox click "took" without
-	// looking at the menu itself - log every flip
-	cemuLog_log(LogType::Force, "Debug menu: Anti-aliasing FXAA (Vulkan) set to {}", LatteTAA::GetConfig().enabled);
-}
-
-// switches the AA pass between single-frame FXAA (default, no history, cannot
-// corrupt) and the temporal resolve (jitter + history blend - the path with
-// the known in-game-cutscene corruption bug, kept around for experimentation
-// since the menu consolidation removed its own toggle in favor of the env var
-// CEMU_TAA_FXAA). Unchecked = FXAA, checked = temporal
-void MainWindow::OnDebugTAATemporalToggle(wxCommandEvent& event)
-{
-	LatteTAA::GetConfig().useFxaa = !event.IsChecked();
-	LatteTAA::InvalidateHistory();
-	cemuLog_log(LogType::Force, "Debug menu: TAA temporal resolve set to {} (useFxaa={})", event.IsChecked(), LatteTAA::GetConfig().useFxaa);
+	// way to confirm from log.txt alone whether a click "took" without looking
+	// at the menu itself - log every mode change
+	const char* modeName = (id == MAINFRAME_MENU_ID_DEBUG_AA_OFF) ? "off"
+		: (id == MAINFRAME_MENU_ID_DEBUG_AA_FXAA) ? "FXAA"
+		: (id == MAINFRAME_MENU_ID_DEBUG_AA_TAA) ? "TAA" : "DLAA";
+	cemuLog_log(LogType::Force, "Debug menu: anti-aliasing mode set to {} (taaEnabled={} useFxaa={} dlaa={})",
+		modeName, taa.enabled, taa.useFxaa, LatteDLSS::GetConfig().enabled);
 }
 
 // one menu entry drives the whole screen-space effects pass (HBAO + SSR +
@@ -1165,23 +1173,29 @@ void MainWindow::OnDebugSSAOToggle(wxCommandEvent& event)
 	cemuLog_log(LogType::Force, "Debug menu: Screen-space effects set to {}", event.IsChecked());
 }
 
-// DLAA needs TAA's temporal mode (motion vectors) active underneath it - see
-// VulkanDLSSFilter::Apply, which bails if TAA's MV pass didn't run this frame
-void MainWindow::OnDebugDLAAToggle(wxCommandEvent& event)
+// See Core/LatteGeometryAmp.h - subdivides eligible triangle draws 1->4 via an
+// injected geometry shader to round out low-poly character meshes exposed by
+// 4K texture replacement (confirmed real geometry limit on Bayonetta 2's
+// arms, not a shading bug). This flag is only consulted in
+// PipelineCompiler::InitFromCurrentGPUState, which only runs on a pipeline
+// CACHE MISS - any pipeline the game already drew (and so already cached,
+// in-memory or in shaderCache/driver+transferable's *.bin on disk) before you
+// flip this keeps whatever it was compiled with. Toggle it before loading the
+// game, or clear the driver/vk + transferable *_vkpipeline.bin cache files
+// and restart, to make it apply to draws already seen this session
+void MainWindow::OnDebugGeometryAmpToggle(wxCommandEvent& event)
 {
-	LatteDLSS::GetConfig().enabled = event.IsChecked();
-	cemuLog_log(LogType::Force, "Debug menu: DLAA (NVIDIA NGX) set to {}", event.IsChecked());
+	LatteGeometryAmp::GetConfig().enabled = event.IsChecked();
+	cemuLog_log(LogType::Force, "Debug menu: Geometry amplification set to {}", event.IsChecked());
 }
 
-// hardware motion vectors (VK_NV_optical_flow) instead of the block-matching
-// search - see VulkanTAAFilter's cross-queue pipeline; falls back to the
-// block-matching search automatically if this system/driver has no dedicated
-// optical flow queue (logged once, see VulkanTAAFilter::CreateOpticalFlowSession)
-void MainWindow::OnDebugOpticalFlowToggle(wxCommandEvent& event)
-{
-	LatteTAA::GetConfig().useOpticalFlow = event.IsChecked();
-	cemuLog_log(LogType::Force, "Debug menu: hardware optical flow motion vectors set to {}", event.IsChecked());
-}
+// DLAA needs TAA's temporal mode (motion vectors) active underneath it - see
+// VulkanDLSSFilter::Apply, which bails if TAA's MV pass didn't run this frame
+// (the standalone DLAA toggle was folded into OnDebugAAModeSelect above)
+
+// (no motion-vector menu handlers: the TAA/DLAA modes always use the best
+// available MV source automatically - see the note at the menu creation site.
+// CEMU_TAA_OPTICALFLOW / CEMU_TAA_ANALYTICALMV remain as env-var overrides)
 
 void MainWindow::OnDebugTexReplaceDumpToggle(wxCommandEvent& event)
 {
@@ -2340,11 +2354,27 @@ void MainWindow::RecreateMenu()
 	auto accurateBarriers = debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_VK_ACCURATE_BARRIERS, _("&Accurate barriers (Vulkan)"), wxEmptyString);
 	accurateBarriers->Check(GetConfig().vk_accurate_barriers);
 
-	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA, _("&Anti-aliasing FXAA (Vulkan)"), wxEmptyString)->Check(LatteTAA::GetConfig().enabled);
-	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TAA_TEMPORAL, _("&TAA: use temporal resolve instead of FXAA (experimental, cutscene corruption known)"), wxEmptyString)->Check(!LatteTAA::GetConfig().useFxaa);
+	// anti-aliasing mode radio group (consecutive AppendRadioItem calls form one
+	// wx radio group) - each entry sets the full LatteTAA/LatteDLSS combination,
+	// see OnDebugAAModeSelect
+	wxMenuItem* aaOffItem = debugMenu->AppendRadioItem(MAINFRAME_MENU_ID_DEBUG_AA_OFF, _("&Anti-aliasing: off"), wxEmptyString);
+	wxMenuItem* aaFxaaItem = debugMenu->AppendRadioItem(MAINFRAME_MENU_ID_DEBUG_AA_FXAA, _("&Anti-aliasing: FXAA (single-frame, Vulkan)"), wxEmptyString);
+	wxMenuItem* aaTaaItem = debugMenu->AppendRadioItem(MAINFRAME_MENU_ID_DEBUG_AA_TAA, _("&Anti-aliasing: TAA (temporal + jitter, Vulkan)"), wxEmptyString);
+	wxMenuItem* aaDlaaItem = debugMenu->AppendRadioItem(MAINFRAME_MENU_ID_DEBUG_AA_DLAA, _("&Anti-aliasing: DLAA (NVIDIA NGX, RTX only, Vulkan)"), wxEmptyString);
+	if (!LatteTAA::GetConfig().enabled)
+		aaOffItem->Check();
+	else if (LatteTAA::GetConfig().useFxaa)
+		aaFxaaItem->Check();
+	else if (LatteDLSS::GetConfig().enabled)
+		aaDlaaItem->Check();
+	else
+		aaTaaItem->Check();
 	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_SSAO, _("&Screen-space effects: HBAO + SSR + SSGI + contact shadows (Vulkan)"), wxEmptyString)->Check(LatteSSAO::AnyEffectEnabled());
-	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_DLAA, _("&DLAA - real NVIDIA NGX/DLSS (Vulkan, RTX only, needs TAA temporal + jitter)"), wxEmptyString)->Check(LatteDLSS::GetConfig().enabled);
-	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_OPTICALFLOW, _("&Motion vectors: hardware optical flow instead of block-matching (Vulkan, RTX Ampere+)"), wxEmptyString)->Check(LatteTAA::GetConfig().useOpticalFlow);
+	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_GEOMETRYAMP, _("&Geometry amplification: 1->4 triangle subdivision (Vulkan, experimental)"), wxEmptyString)->Check(LatteGeometryAmp::GetConfig().enabled);
+	// (no motion-vector menu items: TAA/DLAA always use the best available source
+	// automatically - block-matching/optical-flow estimator + hybrid camera
+	// reprojection refinement (useAnalyticalMV, default on). Env vars
+	// CEMU_TAA_OPTICALFLOW / CEMU_TAA_ANALYTICALMV remain as debug overrides)
 	debugMenu->AppendCheckItem(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_DUMP, _("&Textures: dump for replacement (hash)"), wxEmptyString)->Check(LatteTextureReplacement::IsDumpEnabled());
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_RELOAD, _("Textures: &reload replacement folder"), wxEmptyString);
 	debugMenu->Append(MAINFRAME_MENU_ID_DEBUG_TEXREPLACE_FORGET, _("Textures: &forget replacements (unloads all loaded textures)"), wxEmptyString);

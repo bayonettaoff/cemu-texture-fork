@@ -8,6 +8,8 @@
 #include "Cafe/HW/Latte/Core/LatteBufferCache.h"
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
+#include "Cafe/HW/Latte/Core/Latte.h"
+#include "Cafe/HW/Latte/ISA/RegDefines.h"
 
 #include "Cafe/HW/Latte/LegacyShaderDecompiler/LatteDecompiler.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
@@ -683,7 +685,7 @@ VulkanRenderer::VulkanRenderer()
 	m_textureReadbackBufferPtr = (uint8*)bufferPtr;
 
 	// transform feedback ringbuffer
-	memoryManager->CreateBuffer(LatteStreamout_GetRingBufferSize(), VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (m_featureControl.mode.useTFEmulationViaSSBO ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0), 0, m_xfbRingBuffer, m_xfbRingBufferMemory);
+	memoryManager->CreateBuffer(LatteStreamout_GetRingBufferSize(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (m_featureControl.mode.useTFEmulationViaSSBO ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT), 0, m_xfbRingBuffer, m_xfbRingBufferMemory);
 
 	// occlusion query result buffer
 	memoryManager->CreateBuffer(OCCLUSION_QUERY_POOL_SIZE * sizeof(uint64), VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, m_occlusionQueries.bufferQueryResults, m_occlusionQueries.memoryQueryResults);
@@ -1812,7 +1814,6 @@ void VulkanRenderer::ImguiInit()
 {
 	if (m_imguiRenderPass == VK_NULL_HANDLE)
 	{
-		// TODO: renderpass swapchain format may change between srgb and rgb -> need reinit
 		VkAttachmentDescription colorAttachment = {};
 		colorAttachment.format = m_mainSwapchainInfo->m_surfaceFormat.format;
 		colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -2928,6 +2929,15 @@ void VulkanRenderer::RecreateSwapchain(bool mainWindow, bool skipCreate)
 	if (mainWindow)
 	{
 		ImGui_ImplVulkan_Shutdown();
+		// the swapchain recreate below may change the surface format (e.g. UNORM <-> SRGB), so the
+		// imgui renderpass (built against the old format) must be torn down too - otherwise ImguiInit()
+		// silently reuses the stale one (its VK_NULL_HANDLE guard never re-triggers) and imgui ends up
+		// drawing into a renderpass instance whose format doesn't match the fresh swapchain framebuffers
+		if (m_imguiRenderPass != VK_NULL_HANDLE)
+		{
+			vkDestroyRenderPass(m_logicalDevice, m_imguiRenderPass, nullptr);
+			m_imguiRenderPass = VK_NULL_HANDLE;
+		}
 		gui_getWindowPhysSize(size.x, size.y);
 	}
 	else
@@ -3079,8 +3089,464 @@ void VulkanRenderer::NotifyLatteCommandProcessorIdle()
 
 void VulkanBenchmarkPrintResults();
 
+// ---------------------------------------------------------------------------
+// Camera view-projection probe (2026-07-14, ported from the sibling RT fork).
+// See VulkanRenderer.h's m_camCached*/m_camPrev* comment for the rationale.
+// Ported as close to the original as possible (proven, already found and fixed
+// one bug there the same day) rather than redesigned, to minimize transcription
+// risk.
+namespace
+{
+// sourceType identifies where the matrix data lives:
+//   0 = VS uniform block (slot 0..15, offset in bytes within block at contextRegister[mmSQ_VTX_UNIFORM_BLOCK_START + slot*7])
+//   1 = ALU constant file (slot unused, offset in bytes within contextRegister[mmSQ_ALU_CONSTANT0_0..])
+// Bayonetta-class titles use the ALU constant file; UE-style titles use uniform blocks.
+struct ProjCandidate
+{
+	int      sourceType;
+	int      slot;
+	uint32_t offset;
+	bool     transposed;
+	int      observations;
+	float    driftEMA;
+	float    lastMat[16];
+	bool     hasLast;
+};
+
+struct ViewCandidate
+{
+	int      sourceType;
+	int      slot;
+	uint32_t offset;
+	bool     transposed;
+	int      observations;
+	int      dynamicHits;
+	float    driftEMA;
+	float    lastMat[16];
+	float    lastTrans[3];
+	bool     hasLast;
+};
+
+constexpr int      kProbeMaxFrames    = 180;  // observation budget (called once per frame)
+constexpr int      kProbeMinObs       = 30;   // candidates need this many observations to be considered
+constexpr uint32_t kProbeMaxOffset    = 1024; // scan first 1KB of each block (covers the matrix area)
+constexpr int      kProbeMaxSlots     = 16;
+
+// Inverse a row-major mat4. Returns false on singular or non-finite det.
+bool camInverseMat4Local(const float m[16], float out[16])
+{
+	float inv[16];
+	inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15]  + m[9]*m[7]*m[14]  + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+	inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15]  - m[8]*m[7]*m[14]  - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+	inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15]  + m[8]*m[7]*m[13]  + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+	inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14]  - m[8]*m[6]*m[13]  - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+	inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15]  - m[9]*m[3]*m[14]  - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+	inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15]  + m[8]*m[3]*m[14]  + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+	inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15]  - m[8]*m[3]*m[13]  - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+	inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14]  + m[8]*m[2]*m[13]  + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+	inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15]  + m[5]*m[3]*m[14]  + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+	inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15]  - m[4]*m[3]*m[14]  - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+	inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15]  + m[4]*m[3]*m[13]  + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+	inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14]  - m[4]*m[2]*m[13]  - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+	inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11]  - m[5]*m[3]*m[10]  - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+	inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11]  + m[4]*m[3]*m[10]  + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+	inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11]  - m[4]*m[3]*m[9]   - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+	inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10]  + m[4]*m[2]*m[9]   + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+	float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+	if (!std::isfinite(det) || std::abs(det) < 1e-8f)
+		return false;
+	float invDet = 1.0f / det;
+	for (int i = 0; i < 16; i++) out[i] = inv[i] * invDet;
+	return true;
+}
+
+void camTransposeMat4Local(const float in[16], float out[16])
+{
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+			out[c * 4 + r] = in[r * 4 + c];
+}
+
+// 4x4 matrix multiply, math row-major: out[i][j] = sum_k A[i][k] * B[k][j]
+void camMat4MulLocal(const float A[16], const float B[16], float out[16])
+{
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+		{
+			float s = 0.f;
+			for (int k = 0; k < 4; k++) s += A[r * 4 + k] * B[k * 4 + c];
+			out[r * 4 + c] = s;
+		}
+}
+
+// Detect a perspective projection matrix. Treats `mat` as math row-major.
+bool camIsPlausibleProj(const float mat[16])
+{
+	for (int i = 0; i < 16; i++)
+		if (!std::isfinite(mat[i])) return false;
+	if (std::abs(mat[15]) > 0.1f) return false;
+	bool pdivAt11 = std::abs(mat[11] + 1.f) < 0.2f;
+	bool pdivAt14 = std::abs(mat[14] + 1.f) < 0.2f;
+	if (!pdivAt11 && !pdivAt14) return false;
+	if (mat[0] < 0.3f  || mat[0] > 12.f) return false;
+	if (mat[5] < 0.3f  || mat[5] > 12.f) return false;
+	if (std::abs(mat[1]) > 0.5f) return false;
+	if (std::abs(mat[4]) > 0.5f) return false;
+	return true;
+}
+
+// Detect a rigid view (camera) matrix. Translation goes into transOut.
+bool camIsPlausibleView(const float mat[16], float transOut[3])
+{
+	for (int i = 0; i < 16; i++)
+		if (!std::isfinite(mat[i])) return false;
+	if (std::abs(mat[15] - 1.f) > 0.1f) return false;
+	bool rowMajor = std::abs(mat[12]) < 0.05f && std::abs(mat[13]) < 0.05f && std::abs(mat[14]) < 0.05f;
+	bool colMajor = std::abs(mat[3])  < 0.05f && std::abs(mat[7])  < 0.05f && std::abs(mat[11]) < 0.05f;
+	if (!rowMajor && !colMajor) return false;
+	if (rowMajor)
+	{
+		transOut[0] = mat[3]; transOut[1] = mat[7]; transOut[2] = mat[11];
+	}
+	else
+	{
+		transOut[0] = mat[12]; transOut[1] = mat[13]; transOut[2] = mat[14];
+	}
+	float tmag = std::abs(transOut[0]) + std::abs(transOut[1]) + std::abs(transOut[2]);
+	if (tmag > 1e6f) return false;
+	float r0 = std::sqrt(mat[0] * mat[0] + mat[1] * mat[1] + mat[2] * mat[2]);
+	float r1 = std::sqrt(mat[4] * mat[4] + mat[5] * mat[5] + mat[6] * mat[6]);
+	float r2 = std::sqrt(mat[8] * mat[8] + mat[9] * mat[9] + mat[10] * mat[10]);
+	if (r0 < 0.5f || r0 > 2.0f) return false;
+	if (r1 < 0.5f || r1 > 2.0f) return false;
+	if (r2 < 0.5f || r2 > 2.0f) return false;
+	return true;
+}
+
+// Read a 4x4 from a candidate's source. sourceType: 0=uniform block, 1=ALU constant file.
+bool camReadCandidateMat(int sourceType, int slot, uint32_t offset, bool transposed, float out[16])
+{
+	if (sourceType == 0)
+	{
+		MPTR addr = LatteGPUState.contextRegister[mmSQ_VTX_UNIFORM_BLOCK_START + slot * 7 + 0];
+		uint32 sz = LatteGPUState.contextRegister[mmSQ_VTX_UNIFORM_BLOCK_START + slot * 7 + 1] + 1;
+		if (addr == MPTR_NULL || sz < offset + 64) return false;
+		const float* data = (const float*)memory_getPointerFromPhysicalOffset(addr);
+		if (!data) return false;
+		std::memcpy(out, data + offset / 4, 64);
+	}
+	else // ALU constant file (256 vec4s = 1024 dwords starting at mmSQ_ALU_CONSTANT0_0).
+	{
+		constexpr uint32_t kAluBytes = 256 * 16;
+		if (offset + 64 > kAluBytes) return false;
+		const float* alu = reinterpret_cast<const float*>(&LatteGPUState.contextRegister[mmSQ_ALU_CONSTANT0_0]);
+		std::memcpy(out, alu + offset / 4, 64);
+	}
+	if (transposed)
+	{
+		float t[16];
+		camTransposeMat4Local(out, t);
+		std::memcpy(out, t, 64);
+	}
+	return true;
+}
+
+// Compute camera world position from inverse VP. Returns false on degenerate matrices.
+bool camExtractCamPos(const float invVPMath[16], float camOut[3])
+{
+	float cx = invVPMath[3], cy = invVPMath[7], cz = invVPMath[11], cw = invVPMath[15];
+	if (!std::isfinite(cw) || std::abs(cw) < 1e-6f) return false;
+	cx /= cw; cy /= cw; cz /= cw;
+	if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(cz)) return false;
+	camOut[0] = cx; camOut[1] = cy; camOut[2] = cz;
+	return true;
+}
+} // anonymous namespace
+
+void VulkanRenderer::ProbeVPMatrix()
+{
+	static std::vector<ProjCandidate> s_projCands;
+	static std::vector<ViewCandidate> s_viewCands;
+	static int s_lockedProjIdx  = -1;
+	static int s_lockedViewIdx  = -1;
+	static int s_combineMode    = 0;  // 0=P*V, 1=V*P, 2=P^T*V, 3=V*P^T
+	static int s_probeFrames    = 0;
+	static int s_lockMissStreak = 0;
+
+	auto loseLock = [&](const char* why) {
+		cemuLog_log(LogType::Force, "Cam VP probe: lost lock ({}), restarting", why);
+		s_lockedProjIdx = s_lockedViewIdx = -1;
+		s_probeFrames = 0; s_lockMissStreak = 0;
+		s_projCands.clear(); s_viewCands.clear();
+		m_camHasValidVP = false;
+	};
+
+	// ----- LOCKED PATH -----
+	if (s_lockedProjIdx >= 0 && s_lockedViewIdx >= 0)
+	{
+		const ProjCandidate& pc = s_projCands[s_lockedProjIdx];
+		const ViewCandidate& vc = s_viewCands[s_lockedViewIdx];
+
+		float proj[16], view[16];
+		if (!camReadCandidateMat(pc.sourceType, pc.slot, pc.offset, pc.transposed, proj) ||
+		    !camReadCandidateMat(vc.sourceType, vc.slot, vc.offset, vc.transposed, view))
+		{
+			if (++s_lockMissStreak > 30) loseLock("read failed");
+			return;
+		}
+		float dummyT[3];
+		if (!camIsPlausibleProj(proj) || !camIsPlausibleView(view, dummyT))
+		{
+			if (++s_lockMissStreak > 30) loseLock("signatures invalid");
+			return;
+		}
+
+		float vp[16], pT[16];
+		switch (s_combineMode)
+		{
+		case 0: camMat4MulLocal(proj, view, vp); break;
+		case 1: camMat4MulLocal(view, proj, vp); break;
+		case 2: camTransposeMat4Local(proj, pT); camMat4MulLocal(pT, view, vp); break;
+		case 3: camTransposeMat4Local(proj, pT); camMat4MulLocal(view, pT, vp); break;
+		}
+
+		float invMath[16], cam[3];
+		if (!camInverseMat4Local(vp, invMath) || !camExtractCamPos(invMath, cam))
+		{
+			if (++s_lockMissStreak > 30) loseLock("inverse failed");
+			return;
+		}
+
+		s_lockMissStreak = 0;
+		camTransposeMat4Local(vp, m_camCachedVPColMajor);
+		camTransposeMat4Local(invMath, m_camCachedInvVPColMajor);
+		m_camCachedCamPos[0] = cam[0];
+		m_camCachedCamPos[1] = cam[1];
+		m_camCachedCamPos[2] = cam[2];
+		m_camHasValidVP      = true;
+		return;
+	}
+
+	// ----- PROBING PATH -----
+	s_probeFrames++;
+	int  nonNullUBSlots = 0;
+	int  aluHasData     = 0;
+
+	auto testCandidate = [&](int sourceType, int slot, uint32_t off, const float* dataBase) {
+		for (int trans = 0; trans < 2; trans++)
+		{
+			float mat[16];
+			std::memcpy(mat, dataBase + off / 4, 64);
+			if (trans)
+			{
+				float t[16];
+				camTransposeMat4Local(mat, t);
+				std::memcpy(mat, t, 64);
+			}
+			if (camIsPlausibleProj(mat))
+			{
+				int idx = -1;
+				for (int i = 0; i < (int)s_projCands.size(); i++)
+					if (s_projCands[i].sourceType == sourceType &&
+					    s_projCands[i].slot == slot &&
+					    s_projCands[i].offset == off &&
+					    s_projCands[i].transposed == (trans != 0))
+					{ idx = i; break; }
+				if (idx < 0)
+				{
+					idx = (int)s_projCands.size();
+					s_projCands.push_back({ sourceType, slot, off, trans != 0, 0, 0.f, {}, false });
+				}
+				ProjCandidate& c = s_projCands[idx];
+				c.observations++;
+				if (c.hasLast)
+				{
+					float drift = 0.f;
+					for (int i = 0; i < 16; i++) drift += std::abs(mat[i] - c.lastMat[i]);
+					c.driftEMA = c.driftEMA * 0.9f + drift * 0.1f;
+				}
+				std::memcpy(c.lastMat, mat, 64);
+				c.hasLast = true;
+			}
+			float trans3[3];
+			if (camIsPlausibleView(mat, trans3))
+			{
+				int idx = -1;
+				for (int i = 0; i < (int)s_viewCands.size(); i++)
+					if (s_viewCands[i].sourceType == sourceType &&
+					    s_viewCands[i].slot == slot &&
+					    s_viewCands[i].offset == off &&
+					    s_viewCands[i].transposed == (trans != 0))
+					{ idx = i; break; }
+				if (idx < 0)
+				{
+					idx = (int)s_viewCands.size();
+					s_viewCands.push_back({ sourceType, slot, off, trans != 0, 0, 0, 0.f, {}, {}, false });
+				}
+				ViewCandidate& c = s_viewCands[idx];
+				c.observations++;
+				if (c.hasLast)
+				{
+					float dx = trans3[0] - c.lastTrans[0];
+					float dy = trans3[1] - c.lastTrans[1];
+					float dz = trans3[2] - c.lastTrans[2];
+					float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+					c.driftEMA = c.driftEMA * 0.9f + dist * 0.1f;
+					if (dist > 0.0001f && dist < 50.f) c.dynamicHits++;
+				}
+				c.lastTrans[0] = trans3[0];
+				c.lastTrans[1] = trans3[1];
+				c.lastTrans[2] = trans3[2];
+				std::memcpy(c.lastMat, mat, 64);
+				c.hasLast = true;
+			}
+		}
+	};
+
+	// (1) Scan VS uniform blocks (sourceType=0). Used by UE-style titles.
+	for (int slot = 0; slot < kProbeMaxSlots; slot++)
+	{
+		MPTR   addr = LatteGPUState.contextRegister[mmSQ_VTX_UNIFORM_BLOCK_START + slot * 7 + 0];
+		uint32 sz   = LatteGPUState.contextRegister[mmSQ_VTX_UNIFORM_BLOCK_START + slot * 7 + 1] + 1;
+		if (addr == MPTR_NULL || sz < 64) continue;
+		const float* data = (const float*)memory_getPointerFromPhysicalOffset(addr);
+		if (!data) continue;
+		nonNullUBSlots++;
+		uint32 scanLimit = std::min<uint32>(sz, kProbeMaxOffset);
+		for (uint32 off = 0; off + 64 <= scanLimit; off += 16)
+			testCandidate(0, slot, off, data);
+	}
+
+	// (2) Scan ALU constant file (sourceType=1, slot=0). Used by Bayonetta and most older
+	// Wii U titles that load constants directly into the constant file via SQ_ALU_CONSTANT0_*.
+	{
+		const float* alu = reinterpret_cast<const float*>(&LatteGPUState.contextRegister[mmSQ_ALU_CONSTANT0_0]);
+		constexpr uint32_t kAluBytes = 256 * 16;
+		for (uint32_t i = 0; i < 16; i++)
+			if (alu[i] != 0.f) { aluHasData = 1; break; }
+		for (uint32_t off = 0; off + 64 <= kAluBytes; off += 16)
+			testCandidate(1, 0, off, alu);
+	}
+	(void)nonNullUBSlots; (void)aluHasData;
+
+	if (s_probeFrames < kProbeMaxFrames) return;
+
+	int bestProjIdx = -1; float bestProjScore = -1e9f;
+	for (int i = 0; i < (int)s_projCands.size(); i++)
+	{
+		const ProjCandidate& c = s_projCands[i];
+		if (c.observations < kProbeMinObs) continue;
+		float score = (float)c.observations - c.driftEMA * 100.f;
+		if (score > bestProjScore) { bestProjScore = score; bestProjIdx = i; }
+	}
+
+	int bestViewIdx = -1; float bestViewScore = -1e9f;
+	for (int i = 0; i < (int)s_viewCands.size(); i++)
+	{
+		const ViewCandidate& c = s_viewCands[i];
+		if (c.observations < kProbeMinObs) continue;
+		if (c.driftEMA > 100.f) continue;
+		if (c.dynamicHits < 5) continue;
+		float score = (float)c.dynamicHits;
+		if (score > bestViewScore) { bestViewScore = score; bestViewIdx = i; }
+	}
+
+	if (bestProjIdx < 0 || bestViewIdx < 0)
+	{
+		s_projCands.clear(); s_viewCands.clear();
+		s_probeFrames = 0;
+		return;
+	}
+
+	int   bestMode      = -1;
+	float bestMatch     = 1e30f;
+	float bestVP[16]    = {};
+	float bestInvVP[16] = {};
+	float bestCam[3]    = {};
+	const ProjCandidate& pc = s_projCands[bestProjIdx];
+	const ViewCandidate& vc = s_viewCands[bestViewIdx];
+	const float* proj = pc.lastMat;
+	const float* view = vc.lastMat;
+	const float* vt   = vc.lastTrans;
+
+	for (int mode = 0; mode < 4; mode++)
+	{
+		float vp[16], pT[16], invMath[16], cam[3];
+		switch (mode)
+		{
+		case 0: camMat4MulLocal(proj, view, vp); break;
+		case 1: camMat4MulLocal(view, proj, vp); break;
+		case 2: camTransposeMat4Local(proj, pT); camMat4MulLocal(pT, view, vp); break;
+		case 3: camTransposeMat4Local(proj, pT); camMat4MulLocal(view, pT, vp); break;
+		}
+		if (!camInverseMat4Local(vp, invMath)) continue;
+		if (!camExtractCamPos(invMath, cam)) continue;
+		float pmag = std::abs(cam[0]) + std::abs(cam[1]) + std::abs(cam[2]);
+		if (pmag > 1e6f) continue;
+
+		float dPos = std::abs(cam[0] - vt[0]) + std::abs(cam[1] - vt[1]) + std::abs(cam[2] - vt[2]);
+		float dNeg = std::abs(cam[0] + vt[0]) + std::abs(cam[1] + vt[1]) + std::abs(cam[2] + vt[2]);
+		float match = std::min(dPos, dNeg);
+
+		if (match < bestMatch)
+		{
+			bestMatch = match;
+			bestMode  = mode;
+			std::memcpy(bestVP, vp, 64);
+			std::memcpy(bestInvVP, invMath, 64);
+			std::memcpy(bestCam, cam, 12);
+		}
+	}
+
+	if (bestMode < 0)
+	{
+		s_projCands.clear(); s_viewCands.clear();
+		s_probeFrames = 0;
+		return;
+	}
+
+	s_lockedProjIdx = bestProjIdx;
+	s_lockedViewIdx = bestViewIdx;
+	s_combineMode   = bestMode;
+
+	cemuLog_log(LogType::Force,
+		"Cam VP probe: LOCKED proj=(src={},slot={},off={},t={},drift={:.4f},obs={}) view=(src={},slot={},off={},t={},dyn={},drift={:.4f},obs={}) combineMode={} match={:.3f} cam=({:.2f},{:.2f},{:.2f})",
+		pc.sourceType, pc.slot, pc.offset, (int)pc.transposed, pc.driftEMA, pc.observations,
+		vc.sourceType, vc.slot, vc.offset, (int)vc.transposed, vc.dynamicHits, vc.driftEMA, vc.observations,
+		bestMode, bestMatch, bestCam[0], bestCam[1], bestCam[2]);
+
+	camTransposeMat4Local(bestVP, m_camCachedVPColMajor);
+	camTransposeMat4Local(bestInvVP, m_camCachedInvVPColMajor);
+	m_camCachedCamPos[0] = bestCam[0];
+	m_camCachedCamPos[1] = bestCam[1];
+	m_camCachedCamPos[2] = bestCam[2];
+	m_camHasValidVP      = true;
+}
+// ---------------------------------------------------------------------------
+
 void VulkanRenderer::SwapBuffers(bool swapTV, bool swapDRC)
 {
+	// 2026-07-14: only probe the camera when something actually consumes it -
+	// this used to run unconditionally every frame regardless of
+	// LatteTAA::Config::useAnalyticalMV, adding real per-frame CPU work (uniform
+	// block/ALU constant scanning even in the locked path) that wasn't there
+	// before this feature existed. Gated so the toggle being off means truly
+	// zero added per-frame cost, not just "the analytical MV draw doesn't run"
+	if (LatteTAA::GetConfig().useAnalyticalMV)
+	{
+		// snapshot this frame's already-locked camera as "previous" BEFORE probing
+		// for the new one, then probe - so m_camPrev* always holds the last frame
+		// that had a valid lock, one frame behind m_camCached*
+		if (m_camHasValidVP)
+		{
+			std::memcpy(m_camPrevVPColMajor, m_camCachedVPColMajor, sizeof(m_camPrevVPColMajor));
+			std::memcpy(m_camPrevInvVPColMajor, m_camCachedInvVPColMajor, sizeof(m_camPrevInvVPColMajor));
+			std::memcpy(m_camPrevCamPos, m_camCachedCamPos, sizeof(m_camPrevCamPos));
+			m_camPrevValid = true;
+		}
+		ProbeVPMatrix();
+	}
+
 	SubmitCommandBuffer();
 
 	if (swapTV && IsSwapchainInfoValid(true))
@@ -4001,6 +4467,64 @@ void VulkanRenderer::bufferCache_copyStreamoutToMainBuffer(uint32 srcOffset, uin
 
 void VulkanRenderer::AppendOverlayDebugInfo()
 {
+	// TEMP diagnostic (2026-07-14): verify the ported camera VP probe (see
+	// ProbeVPMatrix, above SwapBuffers) actually locks onto a plausible,
+	// stable camera before wiring anything to use it for motion vectors
+	ImGui::Text("--- Camera VP probe (analytical motion vectors, WIP) ---");
+	ImGui::Text("locked: %s  cam=(%.2f, %.2f, %.2f)", m_camHasValidVP ? "yes" : "no",
+		m_camCachedCamPos[0], m_camCachedCamPos[1], m_camCachedCamPos[2]);
+	ImGui::Text("prev valid: %s  prevCam=(%.2f, %.2f, %.2f)", m_camPrevValid ? "yes" : "no",
+		m_camPrevCamPos[0], m_camPrevCamPos[1], m_camPrevCamPos[2]);
+
+	// cheap sanity check of the reprojection math itself (matrix conventions,
+	// w-divide) BEFORE building the real shader pass around it: pick a fixed
+	// NDC test point (screen center, mid-depth), unproject it to world space
+	// with the CURRENT inverse VP, then reproject that same world point with
+	// (a) the CURRENT forward VP - should round-trip back to ~the same NDC if
+	// VP/invVP are genuine inverses of each other - and (b) the PREVIOUS
+	// forward VP - the actual analytical motion vector for a static point in
+	// the middle of the screen, in NDC units (mul by 0.5*renderwidth/height
+	// to get pixels). A static camera should show ~0; a pan should show a
+	// small, smoothly-varying delta each frame - noise or huge jumps here
+	// mean the matrix convention (row/col-major, transpose) is wrong
+	if (m_camHasValidVP && m_camPrevValid)
+	{
+		auto mulColMajor = [](const float m[16], const float v[4], float out[4]) {
+			for (int r = 0; r < 4; r++)
+			{
+				float s = 0.f;
+				for (int c = 0; c < 4; c++) s += m[c * 4 + r] * v[c];
+				out[r] = s;
+			}
+		};
+		float ndcIn[4] = { 0.f, 0.f, 0.5f, 1.f };
+		float worldH[4];
+		mulColMajor(m_camCachedInvVPColMajor, ndcIn, worldH);
+		if (std::abs(worldH[3]) > 1e-6f)
+		{
+			float world[4] = { worldH[0] / worldH[3], worldH[1] / worldH[3], worldH[2] / worldH[3], 1.f };
+
+			float roundTrip[4];
+			mulColMajor(m_camCachedVPColMajor, world, roundTrip);
+			float rtNdcX = roundTrip[3] != 0.f ? roundTrip[0] / roundTrip[3] : NAN;
+			float rtNdcY = roundTrip[3] != 0.f ? roundTrip[1] / roundTrip[3] : NAN;
+
+			float prevClip[4];
+			mulColMajor(m_camPrevVPColMajor, world, prevClip);
+			float prevNdcX = prevClip[3] != 0.f ? prevClip[0] / prevClip[3] : NAN;
+			float prevNdcY = prevClip[3] != 0.f ? prevClip[1] / prevClip[3] : NAN;
+
+			ImGui::Text("MV sanity: world=(%.2f,%.2f,%.2f) roundTripNDC=(%.4f,%.4f) [want ~0,0]",
+				world[0], world[1], world[2], rtNdcX, rtNdcY);
+			ImGui::Text("MV sanity: prevNDC=(%.4f,%.4f) -> deltaNDC=(%.4f,%.4f)",
+				prevNdcX, prevNdcY, prevNdcX - 0.f, prevNdcY - 0.f);
+		}
+		else
+		{
+			ImGui::Text("MV sanity: degenerate unproject (w~0)");
+		}
+	}
+
 	ImGui::Text("--- Vulkan debug info ---");
 	ImGui::Text("GfxPipelines   %u", performanceMonitor.vk.numGraphicPipelines.get());
 	ImGui::Text("DescriptorSets %u", performanceMonitor.vk.numDescriptorSets.get());

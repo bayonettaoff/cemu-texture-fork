@@ -147,6 +147,7 @@ void LatteMRT::SetDepthAndStencilAttachment(LatteTextureView* view, bool hasSten
 	{
 		LatteSSAO::NotifyDepthBind(view);
 		LatteDLSS::NotifyDepthBind(view);
+		LatteTAA::NotifyDepthBind(view);
 	}
 }
 
@@ -896,8 +897,12 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 	LatteTC_MarkTextureStillInUse(textureView->baseTexture);
 
 	// TAA temporal resolve (Vulkan only)
+	bool taaResolvedThisCall = false;
 	if (!isPadView && LatteTAA::GetConfig().enabled && g_renderer->GetType() == RendererAPI::Vulkan)
+	{
 		VulkanRenderer::GetInstance()->TAA_Apply(textureView);
+		taaResolvedThisCall = VulkanRenderer::GetInstance()->TAA_DidResolveLastCall();
+	}
 
 	// DLAA (NVIDIA NGX/DLSS, Vulkan only), chained after TAA - needs its motion vectors
 	if (!isPadView && LatteDLSS::GetConfig().enabled && g_renderer->GetType() == RendererAPI::Vulkan)
@@ -906,6 +911,19 @@ void LatteRenderTarget_copyToBackbuffer(LatteTextureView* textureView, bool isPa
 	// SSAO/SSR fullscreen pass (Vulkan only), chained after TAA/DLAA
 	if (!isPadView && LatteSSAO::AnyEffectEnabled() && g_renderer->GetType() == RendererAPI::Vulkan)
 		VulkanRenderer::GetInstance()->SSAO_Apply(textureView);
+
+	// advance the jitter sequence for the NEXT frame only now that every consumer
+	// of THIS frame's jitter offset (TAA's own resolve above, DLAA, SSAO/SSR) has
+	// already run and read LatteTAA::GetCurrentFrameJitter() - see the comment at
+	// the old call site (removed from VulkanTAAFilter::Apply) for why calling this
+	// any earlier fed later passes next frame's jitter against this frame's data.
+	// Gated on taaResolvedThisCall (not just "TAA is enabled"): copyToBackbuffer
+	// can run multiple times per real rendered frame (re-presents, overlay-only
+	// presents during 30fps-cutscene-at-60Hz) - TAA_Apply's own anti-reprocessing
+	// guards already detect and skip those, so mirror that decision here instead
+	// of advancing unconditionally, or the jitter index races ahead of real frames
+	if (taaResolvedThisCall)
+		LatteTAA::NotifyFramePresented();
 
 	sint32 effectiveWidth, effectiveHeight;
 	textureView->baseTexture->GetEffectiveSize(effectiveWidth, effectiveHeight, 0);
@@ -1119,7 +1137,6 @@ void LatteRenderTarget_updateViewport()
 		if (LatteTAA::GetViewportJitter(
 				LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_Z_ENABLE(),
 				LatteGPUState.contextNew.DB_DEPTH_CONTROL.get_Z_WRITE_ENABLE(),
-				sLatteCurrentRendertargets.colorBuffer[0].view != nullptr,
 				vpWidth, vpHeight,
 				sLatteRenderTargetState.currentEffectiveSize.width,
 				sLatteRenderTargetState.currentEffectiveSize.height,
@@ -1129,22 +1146,32 @@ void LatteRenderTarget_updateViewport()
 			{
 				// depth-independent path (see LatteTAA::Config::clipSpaceJitter):
 				// leave the viewport untouched, the shader decompiler injects the
-				// offset into gl_Position instead. The Vulkan uniform upload
-				// (VulkanRendererCore.cpp, right before the draw) reads this back
-				// and converts it to clip-space units using the same viewport
-				// size this jitter was computed against
-				LatteTAA::SetCurrentDrawJitterPixels(taaJitterX, taaJitterY);
+				// offset into gl_Position instead. Convert to clip-space units HERE,
+				// against the graphic-pack-SCALED vpWidth/vpHeight this draw actually
+				// rasterizes with (in scope right above; guaranteed non-tiny by
+				// GetViewportJitter's own viewport checks) - NOT against the game's
+				// native viewport (LatteRenderTarget_GetCurrentVirtualViewportSize),
+				// which the uniform upload used previously. The jitter offset is in
+				// EFFECTIVE render-target pixels; dividing by the native size scaled
+				// the on-screen jitter up by the internal-resolution multiplier,
+				// desyncing it from every consumer's un-jitter compensation (see
+				// SetCurrentDrawJitterClipSpace's comment in LatteTAA.h). The signed
+				// vpHeight keeps the same Y sign convention the previous conversion
+				// had (currentGuestViewport.height carries the same sign)
+				LatteTAA::SetCurrentDrawJitterClipSpace(
+					taaJitterX * 2.0f / vpWidth,
+					taaJitterY * 2.0f / vpHeight);
 			}
 			else
 			{
 				vpX += taaJitterX;
 				vpY += taaJitterY;
-				LatteTAA::SetCurrentDrawJitterPixels(0.0f, 0.0f);
+				LatteTAA::SetCurrentDrawJitterClipSpace(0.0f, 0.0f);
 			}
 		}
 		else
 		{
-			LatteTAA::SetCurrentDrawJitterPixels(0.0f, 0.0f);
+			LatteTAA::SetCurrentDrawJitterClipSpace(0.0f, 0.0f);
 		}
 	}
 	g_renderer->renderTarget_setViewport(vpX, vpY, vpWidth, vpHeight, nearZ, farZ, halfZ);

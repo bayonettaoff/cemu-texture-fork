@@ -118,6 +118,8 @@ add_library(CemuCafe
   HW/Latte/Core/LatteTAA.h
   HW/Latte/Core/LatteSSAO.cpp
   HW/Latte/Core/LatteSSAO.h
+  HW/Latte/Core/LatteGeometryAmp.cpp
+  HW/Latte/Core/LatteGeometryAmp.h
   HW/Latte/Core/LatteDLSS.cpp
   HW/Latte/Core/LatteDLSS.h
   HW/Latte/Core/LatteRingBuffer.cpp

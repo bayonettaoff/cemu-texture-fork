@@ -277,6 +277,22 @@ void VulkanDLSSFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scano
 		return;
 	}
 
+	// size our resources BEFORE the depth acquisition below: NotifyDepthBind refuses
+	// to cache candidate depth views while m_width <= 0 (nothing to match against),
+	// and m_width is only set inside RecreateIfNeeded - when this ran after the depth
+	// check, a session whose first Apply() didn't luck into a still-bound depth
+	// attachment (tier 1, usually unbound by HUD draws) deadlocked permanently:
+	// no m_width -> NotifyDepthBind stores nothing -> tier 2/3 forever empty ->
+	// every Apply() exits at "no depth buffer found" -> RecreateIfNeeded never runs.
+	// Running it first breaks the cycle: the first Apply() may still lack depth, but
+	// from then on NotifyDepthBind accepts scene-sized binds and the next frame works
+	if (!RecreateIfNeeded(renderer, effWidth, effHeight, scanoutTex->GetFormat()))
+	{
+		diagState("RecreateIfNeeded failed (see preceding log line for the reason)");
+		m_hasValidOutput = false;
+		return;
+	}
+
 	// depth: same 3-tier fallback as VulkanSSAOFilter (current bind / this-frame bind /
 	// cross-frame cache) - kept as an independent cache rather than reading SSAO's, since
 	// SSAO can be toggled off while DLAA stays on. See VulkanSSAOFilter::Apply for why
@@ -327,13 +343,6 @@ void VulkanDLSSFilter::Apply(VulkanRenderer* renderer, LatteTextureViewVk* scano
 		return;
 	}
 	LatteTextureViewVk* depthViewVk = (LatteTextureViewVk*)depthView;
-
-	if (!RecreateIfNeeded(renderer, effWidth, effHeight, scanoutTex->GetFormat()))
-	{
-		diagState("RecreateIfNeeded failed (see preceding log line for the reason)");
-		m_hasValidOutput = false;
-		return;
-	}
 
 	VkDevice device = renderer->GetLogicalDevice();
 	TickPendingDeletes(renderer);

@@ -1,6 +1,8 @@
 #include "Common/precompiled.h"
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
 #include "Cafe/HW/Latte/Core/LatteSSAO.h"
+#include "Cafe/HW/Latte/Renderer/Renderer.h"
+#include "Cafe/HW/Latte/Renderer/Vulkan/VulkanTAAFilter.h"
 
 namespace LatteTAA
 {
@@ -31,6 +33,13 @@ namespace LatteTAA
 				s_config.enabled = (v[0] == '1');
 			if (const char* v = std::getenv("CEMU_TAA_JITTER"))
 				s_config.jitterEnabled = (v[0] == '1');
+			// jitter amplitude (1.0 = +-0.5px, the TAA standard). Lowering it trades
+			// AA quality for less wobble on content our resolve cannot un-jitter
+			// (HUD and the game's screen-anchored post effects are composited into
+			// the scanout WITHOUT jitter, so the global un-jitter shifts them by the
+			// jitter amount every frame - inherent to intercepting post-composition)
+			if (const char* v = std::getenv("CEMU_TAA_JITTER_SCALE"))
+				s_config.jitterScale = (float)std::atof(v);
 			if (const char* v = std::getenv("CEMU_TAA_PASSTHROUGH"))
 				s_config.debugPassthrough = (v[0] == '1');
 			if (const char* v = std::getenv("CEMU_TAA_FXAA"))
@@ -47,11 +56,32 @@ namespace LatteTAA
 				s_config.clipSpaceJitter = (v[0] == '1');
 			if (const char* v = std::getenv("CEMU_TAA_OPTICALFLOW"))
 				s_config.useOpticalFlow = (v[0] == '1');
-			cemuLog_log(LogType::Force, "TAA config: enabled={} jitter={} passthrough={} useFxaa={} useMotionVectors={} mvSearchStep={} mvRegularization={} mvDebugView={} clipSpaceJitter={} useOpticalFlow={}",
+			if (const char* v = std::getenv("CEMU_TAA_ANALYTICALMV"))
+				s_config.useAnalyticalMV = (v[0] == '1');
+			if (const char* v = std::getenv("CEMU_TAA_MVH_DISAGREE"))
+				s_config.mvHybridDisagreePx = (float)std::atof(v);
+			if (const char* v = std::getenv("CEMU_TAA_MVH_COST"))
+				s_config.mvHybridCostMax = (float)std::atof(v);
+			cemuLog_log(LogType::Force, "TAA config: enabled={} jitter={} passthrough={} useFxaa={} useMotionVectors={} mvSearchStep={} mvRegularization={} mvDebugView={} clipSpaceJitter={} useOpticalFlow={} useAnalyticalMV={}",
 				s_config.enabled, s_config.jitterEnabled, s_config.debugPassthrough, s_config.useFxaa,
-				s_config.useMotionVectors, s_config.mvSearchStep, s_config.mvRegularization, s_config.mvDebugView, s_config.clipSpaceJitter, s_config.useOpticalFlow);
+				s_config.useMotionVectors, s_config.mvSearchStep, s_config.mvRegularization, s_config.mvDebugView, s_config.clipSpaceJitter, s_config.useOpticalFlow, s_config.useAnalyticalMV);
 		}
 		return s_config;
+	}
+
+	void NotifyTextureDeletion(LatteTexture* texture)
+	{
+		if (g_renderer && g_renderer->GetType() == RendererAPI::Vulkan)
+			VulkanTAAFilter::GetInstance().NotifyTextureDeletion(texture);
+	}
+
+	void NotifyDepthBind(LatteTextureView* view)
+	{
+		// hot path (every depth attachment change) - bail as cheaply as possible
+		if (!s_config.useAnalyticalMV)
+			return;
+		if (g_renderer && g_renderer->GetType() == RendererAPI::Vulkan)
+			VulkanTAAFilter::GetInstance().NotifyDepthBind(view);
 	}
 
 	void NotifyFramePresented()
@@ -72,7 +102,7 @@ namespace LatteTAA
 
 	static uint32 s_sceneDrawCounter = 0;
 
-	bool GetViewportJitter(bool depthTestEnabled, bool depthWriteEnabled, bool hasColorBuffer,
+	bool GetViewportJitter(bool depthTestEnabled, bool depthWriteEnabled,
 						   float vpWidth, float vpHeight,
 						   sint32 rtWidth, sint32 rtHeight,
 						   float& jitterX, float& jitterY)
@@ -83,10 +113,14 @@ namespace LatteTAA
 		// classifying draws while TAA itself is off but those effects are on
 		if (!s_config.enabled && !LatteSSAO::AnyEffectEnabled())
 			return false;
-		// scene pass heuristic: geometry that tests AND writes depth into a color
-		// buffer. Shadow maps are depth-only; UI has no depth test; post-process
-		// quads may test (func=always) but do not write.
-		if (!depthTestEnabled || !depthWriteEnabled || !hasColorBuffer)
+		// scene pass heuristic: geometry that tests AND writes depth. UI has no
+		// depth test; post-process quads may test (func=always) but do not write.
+		// Depth-only passes are deliberately NOT excluded: camera-space z-prepasses
+		// must receive the same jitter as the color passes or the color pass fails
+		// the depth test along silhouettes (see the header comment). Shadow maps
+		// (also depth-only, must not be jittered) are rejected by the size checks
+		// below instead
+		if (!depthTestEnabled || !depthWriteEnabled)
 			return false;
 		// height is negative in Cemu's viewport convention (Y flip)
 		vpWidth = std::fabs(vpWidth);
@@ -113,6 +147,15 @@ namespace LatteTAA
 			return false;
 		if (rtWidth < (sint32)(0.85f * (float)s_outputWidth) || rtHeight < (sint32)(0.85f * (float)s_outputHeight))
 			return false;
+		// ... and TWO-SIDED: also reject targets meaningfully LARGER than the scene
+		// output. Now that depth-only passes are eligible (z-prepass fix, see the
+		// header comment), this is what keeps shadow maps out - a 4096x4096 shadow
+		// cascade at 4K output passes every check above (bigger than 85% of output,
+		// fully covered by its viewport) but its height wildly exceeds the scene's.
+		// Camera-space scene passes match the output size exactly, so a modest 1.2x
+		// allowance keeps them safely inside
+		if (rtWidth > (sint32)(1.2f * (float)s_outputWidth) || rtHeight > (sint32)(1.2f * (float)s_outputHeight))
+			return false;
 		// this draw is real full-res scene geometry: mark the frame as carrying a
 		// new scene for the overlay-only-present detection (TAA resolve and
 		// SSAO/SSR pass). Evaluated regardless of the jitter kill-switch
@@ -125,19 +168,19 @@ namespace LatteTAA
 		return true;
 	}
 
-	static float s_currentDrawJitterX = 0.0f;
-	static float s_currentDrawJitterY = 0.0f;
+	static float s_currentDrawJitterClipX = 0.0f;
+	static float s_currentDrawJitterClipY = 0.0f;
 
-	void SetCurrentDrawJitterPixels(float jitterX, float jitterY)
+	void SetCurrentDrawJitterClipSpace(float jitterClipX, float jitterClipY)
 	{
-		s_currentDrawJitterX = jitterX;
-		s_currentDrawJitterY = jitterY;
+		s_currentDrawJitterClipX = jitterClipX;
+		s_currentDrawJitterClipY = jitterClipY;
 	}
 
-	void GetCurrentDrawJitterPixels(float& jitterX, float& jitterY)
+	void GetCurrentDrawJitterClipSpace(float& jitterClipX, float& jitterClipY)
 	{
-		jitterX = s_currentDrawJitterX;
-		jitterY = s_currentDrawJitterY;
+		jitterClipX = s_currentDrawJitterClipX;
+		jitterClipY = s_currentDrawJitterClipY;
 	}
 
 	void GetCurrentFrameJitter(float& jitterX, float& jitterY)

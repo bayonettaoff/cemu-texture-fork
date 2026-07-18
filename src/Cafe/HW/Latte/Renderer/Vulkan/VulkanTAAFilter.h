@@ -6,6 +6,8 @@
 #include <chrono>
 
 class VulkanRenderer;
+class LatteTexture;
+class LatteTextureView;
 class LatteTextureVk;
 class LatteTextureViewVk;
 class RendererShaderVk;
@@ -34,6 +36,16 @@ public:
 	// blur buffers).
 	void Apply(VulkanRenderer* renderer, LatteTextureViewVk* scanoutView);
 
+	// true if the most recent Apply() call did a genuine resolve for a new scene
+	// frame, as opposed to an early-return (disabled, re-present with no new
+	// draws, overlay-only present). The jitter sequence (LatteTAA::
+	// NotifyFramePresented) must only advance on a real resolve - see the call
+	// site in LatteRenderTarget_copyToBackbuffer for why: advancing on every
+	// copyToBackbuffer call regardless of this would race the jitter index ahead
+	// of actual rendered frames on the exact re-present patterns (30fps cutscene
+	// presented at 60Hz) these guards exist to detect
+	bool DidResolveLastCall() const { return m_resolvedLastCall; }
+
 	// descriptor set (matching the backbuffer blit layout: binding 0, combined
 	// image sampler) that samples the latest resolved image. Returns null when
 	// there is no valid output of the expected size; the caller then presents
@@ -53,6 +65,15 @@ public:
 	// or before the first Apply(). outWidth/outHeight receive the (half-res) dimensions;
 	// outImage receives the raw VkImage backing the view (NGX needs both).
 	VkImageView GetMotionVectorsViewIfValid(sint32& outWidth, sint32& outHeight, VkImage& outImage);
+
+	// called by LatteTAA::NotifyTextureDeletion (from LatteTexture_Delete) so the
+	// analytical-MV depth cache below never outlives its texture
+	void NotifyTextureDeletion(LatteTexture* texture);
+
+	// called by LatteTAA::NotifyDepthBind (from LatteMRT) on every depth bind - same
+	// cutscene-camera-cut fix as VulkanSSAOFilter's NotifyDepthBind, kept independent
+	// (own cache) for the same reason SSAO/DLSS keep theirs independent
+	void NotifyDepthBind(LatteTextureView* view);
 
 	void Shutdown(VulkanRenderer* renderer);
 
@@ -238,6 +259,7 @@ private:
 	uint32 m_lastSceneDrawCounter{ 0xFFFFFFFF }; // detects presents whose draws were overlays only (no new scene)
 	uint32 m_consecutiveSceneless{ 0 }; // presents in a row without scene draws; past ~30 = pure-2D mode (menus), present raw
 	bool m_hasValidOutput{ false }; // history[m_currentHistory] holds a presentable resolve
+	bool m_resolvedLastCall{ false }; // see DidResolveLastCall()
 
 	// low-framerate detection: games with dynamic framerate (30 fps cutscenes /
 	// 60 fps gameplay) move twice as far per frame at 30 fps, where the blend
@@ -251,6 +273,88 @@ private:
 	static constexpr uint32 kPresentRingSize = 8;
 	VkDescriptorSet m_presentRing[kPresentRingSize]{};
 	uint32 m_presentRingIndex{ 0 };
+
+	// --- analytical (camera-reprojection) motion vectors, 2026-07-14 - see
+	// LatteTAA::Config::useAnalyticalMV. Deliberately kept 100% separate from the
+	// block-matching/optical-flow machinery above (own descriptor set layout, own
+	// pipeline layout/push constant range, own pipeline) - the only thing shared
+	// is m_mvRenderPass/m_mvFramebuffer/m_mvImage (already the right size/format
+	// for exactly this purpose) and m_vertexShader (a generic fullscreen
+	// triangle, same interface every pipeline in this filter already uses).
+	// Writing this analytical result into the SAME m_mvImage the other two
+	// sources write to means the resolve pass and DLAA need zero changes to
+	// consume it - Apply() just picks which source runs each frame. Static
+	// objects (sampler/descriptor set layout/pipeline layout/pool) are created
+	// in CreateStaticObjects, the pipeline itself in CreateSizedObjects (needs
+	// m_mvRenderPass), same split as the rest of this filter's pipelines.
+	// Returns true if the analytical pass ran and wrote m_mvImage this frame
+	// (camera locked + depth available) - Apply() falls back to block-matching/
+	// optical flow when this returns false
+	bool ApplyAnalyticalMV(VulkanRenderer* renderer, VkCommandBuffer cmd);
+
+	struct AnalyticalMVPushConstants
+	{
+		float invVPCurrent[16]; // clip (current frame) -> world, column-major (matches VulkanRenderer::m_camCachedInvVPColMajor)
+		float vpPrevious[16];   // world -> clip (previous frame), column-major (matches m_camPrevVPColMajor)
+		// 2026-07-14: added after first in-game test - the game's OWN depth buffer
+		// is rendered WITH clip-space jitter (see LatteTAA::Config::clipSpaceJitter),
+		// but this pass's own fullscreen triangle is not jittered, so sampling
+		// texDepth at this pass's raw passUV reads the WRONG texel of the jittered
+		// buffer (off by the sub-pixel jitter offset) - small per-pixel errors
+		// invisible to this filter's own resolve (protected by variance clipping)
+		// but not to DLAA's NGX evaluate, which has no equivalent safety net (same
+		// failure mode already documented for the block-matching search, see
+		// mvRegularization's comment). Same unjitter idiom as every other pass
+		// in this filter: sample depth at passUV + jitterUV
+		float jitterUVx;
+		float jitterUVy;
+		// hybrid per-pixel selection (2026-07-15): the estimator's vector wins only
+		// when it disagrees with the analytical one by more than disagreePx FULL-RES
+		// pixels (must sit above the block-matcher's own quantization, ~2.4px at 4K)
+		// AND its match cost (B channel) is below estCostMax (a confident track).
+		// Everything else - agreement, low-texture ambiguity, estimator noise -
+		// resolves to the analytical vector, which is exact for the static world.
+		// outputWidth/Height convert the UV-space disagreement to those pixels
+		float disagreePx;
+		float estCostMax;
+		float outputWidth;
+		float outputHeight;
+	};
+
+	RendererShaderVk* m_analyticalMVShader{};
+	VkDescriptorSetLayout m_analyticalMVDescriptorSetLayout{ VK_NULL_HANDLE };
+	VkPipelineLayout m_analyticalMVPipelineLayout{ VK_NULL_HANDLE };
+	VkPipeline m_pipelineAnalyticalMV{ VK_NULL_HANDLE };
+	VKRObjectSampler* m_analyticalMVSampler{};
+	VkDescriptorPool m_analyticalMVDescriptorPool{ VK_NULL_HANDLE };
+	static constexpr uint32 kAnalyticalMVRingSize = 8;
+	VkDescriptorSet m_analyticalMVDescriptorRing[kAnalyticalMVRingSize]{};
+	uint32 m_analyticalMVDescriptorRingIndex{ 0 };
+
+	// hybrid output target (2026-07-15, RTX-Remix-style per-pixel MV selection):
+	// the estimator (block-matching or optical flow) keeps writing m_mvImage
+	// exactly as before - untouched, zero risk - and the analytical pass now READS
+	// that result (plus depth) and writes the per-pixel combination here: the
+	// camera-reprojection vector (exact, sub-pixel - what RTX Remix computes for
+	// non-animated surfaces) wherever the world is static, the estimator's vector
+	// wherever it confidently disagrees (animated characters, whose motion camera
+	// reprojection cannot know). Same size/format as m_mvImage, same render pass.
+	// Consumers (resolve, DLAA) read this image on frames where the hybrid ran
+	// (m_mvHybridValidThisFrame), m_mvImage otherwise - see
+	// GetMotionVectorsViewIfValid and the resolve's descriptor write
+	VkImage m_mvFinalImage{ VK_NULL_HANDLE };
+	VkDeviceMemory m_mvFinalMemory{ VK_NULL_HANDLE };
+	VKRObjectTexture* m_mvFinalTexObj{};
+	VKRObjectTextureView* m_mvFinalViewObj{};
+	VKRObjectFramebuffer* m_mvFinalFramebuffer{};
+	VkImageLayout m_mvFinalLayout{ VK_IMAGE_LAYOUT_UNDEFINED };
+	bool m_mvHybridValidThisFrame{ false };
+
+	// depth cache - same two-tier (frame-bind / cross-frame) fallback pattern as
+	// VulkanSSAOFilter/VulkanDLSSFilter's own independent copies, see their
+	// comments for the cutscene-camera-cut rationale
+	LatteTextureView* m_cachedDepthView{ nullptr };
+	LatteTextureView* m_frameDepthView{ nullptr };
 
 	// deferred destruction of outdated raw images (VKR wrappers handle their own)
 	struct PendingDelete

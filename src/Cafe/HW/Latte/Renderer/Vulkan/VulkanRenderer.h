@@ -121,6 +121,9 @@ public:
 	// primitive rects emulation
 	RendererShaderVk* rectEmulationGS = nullptr;
 
+	// geometry amplification (LatteGeometryAmp) - injected 1->4 subdivision GS
+	RendererShaderVk* geometryAmpGS = nullptr;
+
 	// hack - accurate barrier needed for this pipeline
 	bool neverSkipAccurateBarrier{false};
 };
@@ -221,6 +224,10 @@ public:
 	// TAA (implemented in VulkanTAAFilter.cpp)
 	void TAA_Apply(LatteTextureView* textureView);
 	VkCommandBuffer TAA_GetCommandBuffer();
+	// true if the TAA_Apply call above did a genuine resolve (as opposed to an
+	// early-return) - see VulkanTAAFilter::DidResolveLastCall for why this gates
+	// the jitter sequence advance in LatteRenderTarget_copyToBackbuffer
+	bool TAA_DidResolveLastCall();
 
 	// SSAO (implemented in VulkanSSAOFilter.cpp)
 	void SSAO_Apply(LatteTextureView* textureView);
@@ -242,6 +249,12 @@ public:
 	// if this system/driver has no queue family reporting VK_QUEUE_OPTICAL_FLOW_BIT_NV
 	int32_t GetOpticalFlowQueueFamilyIndex() const { return m_opticalFlowQueueFamily; }
 	VkQueue GetOpticalFlowQueue() const { return m_opticalFlowQueue; }
+
+	// camera VP probe (see ProbeVPMatrix/m_camCached* declarations below) - for
+	// VulkanTAAFilter's analytical motion vectors (LatteTAA::Config::useAnalyticalMV)
+	bool HasValidCameraVP() const { return m_camHasValidVP && m_camPrevValid; }
+	const float* GetCameraInvVPColMajor() const { return m_camCachedInvVPColMajor; }
+	const float* GetCameraPrevVPColMajor() const { return m_camPrevVPColMajor; }
 
 	VkDescriptorPool GetDescriptorPool() const { return m_descriptorPool; }
 
@@ -531,6 +544,35 @@ private:
 	// from m_graphicsQueue. -1/VK_NULL_HANDLE if no such family exists on this system.
 	int32_t m_opticalFlowQueueFamily{ -1 };
 	VkQueue m_opticalFlowQueue{ VK_NULL_HANDLE };
+
+	// Camera view-projection probe (2026-07-14, ported from the sibling RT fork's
+	// ProbeVPMatrix - see that project's session notes for the full design history,
+	// including a mirrored-camera bug found and fixed there the same day this was
+	// ported). GX2 never exposes the game's camera matrix as a fixed register - only
+	// baked into the game's own vertex shader constants (uniform block or ALU
+	// constant file, differs per title) - so this scans candidate locations each
+	// frame, tests them against structural signatures of a plausible projection/view
+	// matrix, and locks onto the pair that stays internally consistent (reconstructed
+	// camera position matches the view matrix's own translation) across many frames
+	// of real camera motion. Built for analytical motion vectors (see
+	// VulkanRenderer.cpp / ProbeVPMatrix): reproject a pixel's current world position
+	// through the PREVIOUS frame's camera to get exact motion for anything that
+	// didn't move in world space, instead of estimating it from the rendered image
+	// the way optical flow / block-matching do. Confirmed locking correctly in
+	// Bayonetta 2 (cemu-dev port, 2026-07-14): cam=(0.00,1.70,-2.87), same height as
+	// the sibling RT fork found independently
+	void ProbeVPMatrix();
+	float m_camCachedVPColMajor[16]{};    // forward VP, for reprojecting world->clip
+	float m_camCachedInvVPColMajor[16]{}; // inverse VP, for reconstructing world pos from depth
+	float m_camCachedCamPos[3]{};
+	bool  m_camHasValidVP{ false };
+	// previous frame's locked VP, swapped in from m_camCached* once per frame at
+	// SwapBuffers time (before m_camCached* is refreshed for the new frame) - this is
+	// the actual analytical-motion-vector input, current vs previous camera
+	float m_camPrevVPColMajor[16]{};
+	float m_camPrevInvVPColMajor[16]{};
+	float m_camPrevCamPos[3]{};
+	bool  m_camPrevValid{ false };
 
 	// swapchain
 

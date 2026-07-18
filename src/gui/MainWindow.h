@@ -109,11 +109,9 @@ public:
 	void OnPPCInfoToggle(wxCommandEvent& event);
 	void OnDebugDumpUsedTextures(wxCommandEvent& event);
 	void OnDebugDumpUsedShaders(wxCommandEvent& event);
-	void OnDebugTAAToggle(wxCommandEvent& event);
-	void OnDebugTAATemporalToggle(wxCommandEvent& event); // switches FXAA <-> temporal resolve
+	void OnDebugAAModeSelect(wxCommandEvent& event); // anti-aliasing radio group: off / FXAA / TAA / DLAA
 	void OnDebugSSAOToggle(wxCommandEvent& event); // all screen-space effects (HBAO+SSR+contact shadows)
-	void OnDebugDLAAToggle(wxCommandEvent& event); // real NVIDIA NGX/DLSS DLAA
-	void OnDebugOpticalFlowToggle(wxCommandEvent& event); // hardware motion vectors (VK_NV_optical_flow)
+	void OnDebugGeometryAmpToggle(wxCommandEvent& event); // 1->4 triangle subdivision + Phong displacement
 	void OnDebugTexReplaceDumpToggle(wxCommandEvent& event);
 	void OnDebugTexReplaceReload(wxCommandEvent& event);
 	void OnDebugTexReplaceForget(wxCommandEvent& event);

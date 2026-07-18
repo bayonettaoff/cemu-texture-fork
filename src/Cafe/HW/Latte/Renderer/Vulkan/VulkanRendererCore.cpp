@@ -7,6 +7,7 @@
 #include "Cafe/HW/Latte/Core/LattePerformanceMonitor.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Core/LatteTAA.h"
+#include "Cafe/HW/Latte/Core/LatteDLSS.h"
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteIndices.h"
 #include "Cafe/OS/libs/gx2/GX2.h"
@@ -441,18 +442,17 @@ void VulkanRenderer::uniformData_updateUniformVars(uint32 shaderStageIndex, Latt
 		if (shader->uniform.loc_taaJitter >= 0)
 		{
 			// LatteRenderTarget_updateViewport already decided (via LatteTAA::GetViewportJitter)
-			// whether this draw should be jittered and stashed the render-target-pixel offset;
-			// convert it to clip-space units here using the exact same viewport-size source as
-			// uf_windowSpaceToClipSpaceTransform above, so both stay consistent with whatever
-			// Y-flip/sign convention this fork's viewport uses
-			sint32 viewportWidth;
-			sint32 viewportHeight;
-			LatteRenderTarget_GetCurrentVirtualViewportSize(&viewportWidth, &viewportHeight);
-			float jitterPxX, jitterPxY;
-			LatteTAA::GetCurrentDrawJitterPixels(jitterPxX, jitterPxY);
+			// whether this draw should be jittered and stashed the offset ALREADY CONVERTED to
+			// clip-space units against that draw's actual (graphic-pack-scaled) viewport - see
+			// SetCurrentDrawJitterClipSpace in LatteTAA.h for why the conversion cannot happen
+			// here (the native-viewport size available at this site is the wrong denominator).
+			// Always write the value (it's 0,0 for non-jittered draws) - this staging memory
+			// is not zero-initialized, so skipping the write would feed garbage as jitter
+			float jitterClipX, jitterClipY;
+			LatteTAA::GetCurrentDrawJitterClipSpace(jitterClipX, jitterClipY);
 			float* v = GET_UNIFORM_DATA_PTR(shader->uniform.loc_taaJitter);
-			v[0] = jitterPxX * 2.0f / (float)viewportWidth;
-			v[1] = jitterPxY * 2.0f / (float)viewportHeight;
+			v[0] = jitterClipX;
+			v[1] = jitterClipY;
 		}
 		if (shader->uniform.loc_fragCoordScale >= 0)
 		{
@@ -854,7 +854,7 @@ VkDescriptorSetInfo* VulkanRenderer::draw_getOrCreateDescriptorSet(PipelineInfo*
 				samplerInfo.maxAnisotropy = 1.0f;
 			}
 
-			samplerInfo.mipLodBias = (float)iLodBias / 64.0f;
+			samplerInfo.mipLodBias = (float)iLodBias / 64.0f + LatteDLSS::GetMipmapBias();
 
 			// depth compare
 			uint8 depthCompareMode = shader->textureUsesDepthCompare[relative_textureUnit] ? 1 : 0;

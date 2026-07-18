@@ -14,6 +14,7 @@ private:
 	/* shader stages (requires compiled shader) */
 
 	RendererShaderVk* m_rectEmulationGS{};
+	RendererShaderVk* m_geometryAmpGS{};
 
 	bool InitShaderStages(VulkanRenderer* vkRenderer, RendererShaderVk* vkVertexShader, RendererShaderVk* vkPixelShader, RendererShaderVk* vkGeometryShader);
 
